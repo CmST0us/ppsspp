@@ -774,10 +774,11 @@ void MainScreen::CreateViews() {
 	bool vertical = UseVerticalLayout();
 
 	I18NCategory *mm = GetI18NCategory("MainMenu");
-
-	Margins actionMenuMargins(0, 10, 10, 0);
-
-	tabHolder_ = new TabHolder(ORIENT_HORIZONTAL, 64, new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT, 1.0f));
+    
+    Margins actionMenuMargins(0, 10, 64, 0);
+    Margins leftColumnMargin(64, 0, 0, 0);
+    tabHolder_ = new TabHolder(ORIENT_HORIZONTAL, 64, new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT, 1.0f, leftColumnMargin));
+    
 	ViewGroup *leftColumn = tabHolder_;
 	tabHolder_->SetTag("MainScreenGames");
 	gameBrowsers_.clear();
