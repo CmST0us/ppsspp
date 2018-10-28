@@ -173,7 +173,7 @@ void GameSettingsScreen::CreateViews() {
 		verticalLayout->Add(new Choice(di->T("Back"), "", false, new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT, 0.0f, Margins(0))))->OnClick.Handle<UIScreen>(this, &UIScreen::OnBack);
 		root_->Add(verticalLayout);
 	} else {
-		tabHolder = new TabHolder(ORIENT_VERTICAL, 200, new AnchorLayoutParams(10, 0, 10, 0, false));
+		tabHolder = new TabHolder(ORIENT_VERTICAL, 200, new AnchorLayoutParams(64, 0, 64, 0, false));
 		root_->Add(tabHolder);
 		AddStandardBack(root_);
 	}
