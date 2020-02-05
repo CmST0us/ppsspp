@@ -37,8 +37,8 @@ void main() {
 
 static const VkComponentMapping VULKAN_4444_SWIZZLE = { VK_COMPONENT_SWIZZLE_A, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_B };
 static const VkComponentMapping VULKAN_1555_SWIZZLE = { VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_A };
-static const VkComponentMapping VULKAN_565_SWIZZLE = { VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_A };
-static const VkComponentMapping VULKAN_8888_SWIZZLE = { VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_A };
+static const VkComponentMapping VULKAN_565_SWIZZLE = { VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY };
+static const VkComponentMapping VULKAN_8888_SWIZZLE = { VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY };
 
 static VkFormat GetClutDestFormat(GEPaletteFormat format, VkComponentMapping *componentMapping) {
 	switch (format) {
@@ -69,8 +69,11 @@ DepalShaderCacheVulkan::~DepalShaderCacheVulkan() {
 
 void DepalShaderCacheVulkan::DeviceLost() {
 	Clear();
-	if (vshader_)
+	if (vshader_) {
+		vulkan2D_->PurgeVertexShader(vshader_);
 		vulkan_->Delete().QueueDeleteShaderModule(vshader_);
+		vshader_ = VK_NULL_HANDLE;
+	}
 	draw_ = nullptr;
 	vulkan_ = nullptr;
 }
@@ -107,6 +110,7 @@ DepalShaderVulkan *DepalShaderCacheVulkan::GetDepalettizeShader(uint32_t clutMod
 	VkPipeline pipeline = vulkan2D_->GetPipeline(rp, vshader_, fshader);
 	// Can delete the shader module now that the pipeline has been created.
 	// Maybe don't even need to queue it..
+	vulkan2D_->PurgeFragmentShader(fshader, true);
 	vulkan_->Delete().QueueDeleteShaderModule(fshader);
 
 	DepalShaderVulkan *depal = new DepalShaderVulkan();
@@ -129,16 +133,18 @@ VulkanTexture *DepalShaderCacheVulkan::GetClutTexture(GEPaletteFormat clutFormat
 	VkFormat destFormat = GetClutDestFormat(clutFormat, &componentMapping);
 	int texturePixels = clutFormat == GE_CMODE_32BIT_ABGR8888 ? 256 : 512;
 
+	VulkanTexture *vktex = new VulkanTexture(vulkan_);
+	vktex->SetTag("DepalClut");
+	VkCommandBuffer cmd = (VkCommandBuffer)draw_->GetNativeObject(Draw::NativeObject::INIT_COMMANDBUFFER);
+	if (!vktex->CreateDirect(cmd, alloc_, texturePixels, 1, 1, destFormat,
+		VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, &componentMapping)) {
+		ERROR_LOG(G3D, "Failed to create texture for CLUT");
+		return nullptr;
+	}
+
 	VkBuffer pushBuffer;
 	uint32_t pushOffset = push_->PushAligned(rawClut, 1024, 4, &pushBuffer);
 
-	VulkanTexture *vktex = new VulkanTexture(vulkan_, alloc_);
-	vktex->SetTag("DepalClut");
-	VkCommandBuffer cmd = (VkCommandBuffer)draw_->GetNativeObject(Draw::NativeObject::INIT_COMMANDBUFFER);
-	if (!vktex->CreateDirect(cmd, texturePixels, 1, 1, destFormat,
-		VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, &componentMapping)) {
-		Crash();
-	}
 	vktex->UploadMip(cmd, 0, texturePixels, 1, pushBuffer, pushOffset, texturePixels);
 	vktex->EndCreate(cmd);
 

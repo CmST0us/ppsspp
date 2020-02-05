@@ -24,7 +24,7 @@
 #include "InputDevice.h"
 #include "dinput.h"
 
-class DinputDevice :
+class DinputDevice final :
 	public InputDevice
 {
 public:
@@ -32,9 +32,12 @@ public:
 	//getDevices(), enumerates all devices if not done yet
 	DinputDevice(int devnum);
 	~DinputDevice();
-	virtual int UpdateState();
-	virtual bool IsPad() { return true; }
+	virtual int UpdateState() override;
 	static size_t getNumPads();
+	static void CheckDevices() {
+		needsCheck_ = true;
+	}
+
 private:
 	void ApplyButtons(DIJOYSTATE2 &state);
 	//unfortunate and unclean way to keep only one DirectInput instance around
@@ -52,6 +55,7 @@ private:
 	static unsigned int     pInstances;
 	static std::vector<DIDEVICEINSTANCE> devices;
 	static LPDIRECTINPUT8   pDI;
+	static bool needsCheck_;
 	int                     pDevNum;
 	LPDIRECTINPUTDEVICE8    pJoystick;
 	DIJOYSTATE2             pPrevState;

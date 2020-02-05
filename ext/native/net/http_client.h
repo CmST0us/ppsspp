@@ -54,6 +54,8 @@ private:
 
 namespace http {
 
+bool GetHeaderValue(const std::vector<std::string> &responseHeaders, const std::string &header, std::string *value);
+
 class Client : public net::Connection {
 public:
 	Client();
@@ -75,8 +77,14 @@ public:
 	// If your response contains a response, you must read it.
 	int ReadResponseEntity(Buffer *readbuf, const std::vector<std::string> &responseHeaders, Buffer *output, float *progress = nullptr, bool *cancelled = nullptr);
 
+	void SetDataTimeout(double t) {
+		dataTimeout_ = t;
+	}
+
+protected:
 	const char *userAgent_;
 	const char *httpVersion_;
+	double dataTimeout_ = -1.0;
 };
 
 // Not particularly efficient, but hey - it's a background download, that's pretty cool :P
@@ -131,9 +139,12 @@ public:
 
 private:
 	void Do(std::shared_ptr<Download> self);  // Actually does the download. Runs on thread.
+	int PerformGET(const std::string &url);
+	std::string RedirectLocation(const std::string &baseUrl);
 	void SetFailed(int code);
 	float progress_;
 	Buffer buffer_;
+	std::vector<std::string> responseHeaders_;
 	std::string url_;
 	std::string outfile_;
 	int resultCode_;

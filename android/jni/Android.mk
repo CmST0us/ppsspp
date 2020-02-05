@@ -150,7 +150,9 @@ SPIRV_CROSS_FILES := \
   $(SRC)/ext/SPIRV-Cross/spirv_cfg.cpp \
   $(SRC)/ext/SPIRV-Cross/spirv_cross.cpp \
   $(SRC)/ext/SPIRV-Cross/spirv_cross_util.cpp \
-  $(SRC)/ext/SPIRV-Cross/spirv_glsl.cpp
+  $(SRC)/ext/SPIRV-Cross/spirv_glsl.cpp \
+  $(SRC)/ext/SPIRV-Cross/spirv_parser.cpp \
+  $(SRC)/ext/SPIRV-Cross/spirv_cross_parsed_ir.cpp
 
 EXEC_AND_LIB_FILES := \
   $(ARCH_FILES) \
@@ -243,10 +245,12 @@ EXEC_AND_LIB_FILES := \
   $(SRC)/GPU/Common/ShaderUniforms.cpp \
   $(SRC)/GPU/Debugger/Breakpoints.cpp \
   $(SRC)/GPU/Debugger/Debugger.cpp \
+  $(SRC)/GPU/Debugger/Playback.cpp \
   $(SRC)/GPU/Debugger/Record.cpp \
   $(SRC)/GPU/Debugger/Stepping.cpp \
   $(SRC)/GPU/GLES/FramebufferManagerGLES.cpp \
   $(SRC)/GPU/GLES/DepalettizeShaderGLES.cpp \
+  $(SRC)/GPU/GLES/DepthBufferGLES.cpp.arm \
   $(SRC)/GPU/GLES/GPU_GLES.cpp.arm \
   $(SRC)/GPU/GLES/StencilBufferGLES.cpp.arm \
   $(SRC)/GPU/GLES/TextureCacheGLES.cpp.arm \
@@ -390,6 +394,7 @@ EXEC_AND_LIB_FILES := \
   $(SRC)/Core/HLE/sceUsbAcc.cpp \
   $(SRC)/Core/HLE/sceUsbCam.cpp \
   $(SRC)/Core/HLE/sceUsbGps.cpp \
+  $(SRC)/Core/HLE/sceUsbMic.cpp \
   $(SRC)/Core/HLE/sceUtility.cpp \
   $(SRC)/Core/HLE/sceVaudio.cpp \
   $(SRC)/Core/HLE/scePspNpDrm_user.cpp \
@@ -505,6 +510,7 @@ LOCAL_SRC_FILES := \
   $(SRC)/UI/GameScreen.cpp \
   $(SRC)/UI/ControlMappingScreen.cpp \
   $(SRC)/UI/GameSettingsScreen.cpp \
+  $(SRC)/UI/GPUDriverTestScreen.cpp \
   $(SRC)/UI/TiltAnalogSettingsScreen.cpp \
   $(SRC)/UI/TiltEventProcessor.cpp \
   $(SRC)/UI/TouchControlLayoutScreen.cpp \

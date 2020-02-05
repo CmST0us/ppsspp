@@ -18,6 +18,7 @@
 #pragma once
 
 #include <mutex>
+#include <vector>
 
 #include "net/http_client.h"
 #include "net/resolve.h"
@@ -48,8 +49,13 @@ public:
 		cancelConnect_ = true;
 	}
 
+	std::string LatestError() const override {
+		return latestError_;
+	}
+
 private:
 	void Prepare();
+	int SendHEAD(const Url &url, std::vector<std::string> &responseHeaders);
 
 	void Connect();
 
@@ -67,6 +73,7 @@ private:
 	std::string filename_;
 	bool connected_ = false;
 	bool cancelConnect_ = false;
+	const char *latestError_ = "";
 
 	std::once_flag preparedFlag_;
 	std::mutex readAtMutex_;

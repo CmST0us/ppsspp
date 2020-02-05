@@ -1,4 +1,5 @@
 #include "base/logging.h"
+#include "base/stringutil.h"
 #include "net/url.h"
 
 const char *UrlEncoder::unreservedChars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~";
@@ -16,11 +17,15 @@ void Url::Split() {
 	protocol_ = url_.substr(0, colonSlashSlash);
 
 	size_t sep = url_.find('/', colonSlashSlash + 3);
+	if (sep == std::string::npos) {
+		valid_ = false;
+		return;
+	}
 
 	host_ = url_.substr(colonSlashSlash + 3, sep - colonSlashSlash - 3);
 	resource_ = url_.substr(sep);  // include the slash!
 
-	size_t portsep = host_.find(':');
+	size_t portsep = host_.rfind(':');
 	if (portsep != host_.npos) {
 		port_ = atoi(host_.substr(portsep + 1).c_str());
 		host_ = host_.substr(0, portsep);
@@ -29,6 +34,52 @@ void Url::Split() {
 	}
 
 	valid_ = protocol_.size() > 1 && host_.size() > 1;
+}
+
+Url Url::Relative(const std::string &next) const {
+	if (next.size() > 2 && next[0] == '/' && next[1] == '/') {
+		// This means use the same protocol, but the rest is new.
+		return Url(protocol_ + ":" + next);
+	}
+
+	// Or it could just be a fully absolute URL.
+	size_t colonSlashSlash = next.find("://");
+	if (colonSlashSlash != std::string::npos) {
+		return Url(next);
+	}
+
+	// Anything else should be a new resource, but it might be directory relative.
+	Url resolved = *this;
+	if (next.size() > 1 && next[0] == '/') {
+		// Easy, just replace the resource.
+		resolved.resource_ = next;
+	} else {
+		size_t last_slash = resource_.find_last_of('/');
+		resolved.resource_ = resource_.substr(0, last_slash + 1) + next;
+	}
+
+	resolved.url_ = resolved.ToString();
+	return resolved;
+}
+
+std::string Url::ToString() const {
+	if (!valid_) {
+		return "about:invalid-url";
+	}
+
+	std::string serialized = protocol_ + "://" + host_;
+	bool needsPort = true;
+	if (protocol_ == "https") {
+		needsPort = port_ != 443;
+	} else if (protocol_ == "http") {
+		needsPort = port_ != 80;
+	}
+
+	if (needsPort) {
+		serialized += ":" + StringFromInt(port_);
+	}
+
+	return serialized + resource_;
 }
 
 // UriDecode and UriEncode are from http://www.codeguru.com/cpp/cpp/string/conversions/print.php/c12759
@@ -83,8 +134,8 @@ std::string UriDecode(const std::string & sSrc)
 		if (*pSrc == '%')
 		{
 			char dec1, dec2;
-			if (-1 != (dec1 = HEX2DEC[*(pSrc + 1)])
-				&& -1 != (dec2 = HEX2DEC[*(pSrc + 2)]))
+			if (N1 != (dec1 = HEX2DEC[*(pSrc + 1)])
+				&& N1 != (dec2 = HEX2DEC[*(pSrc + 2)]))
 			{
 				*pEnd++ = (dec1 << 4) + dec2;
 				pSrc += 3;

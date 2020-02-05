@@ -33,7 +33,7 @@ public:
 	GameScreen(const std::string &gamePath);
 	~GameScreen();
 
-	void update() override;
+	void render() override;
 
 	std::string tag() const override { return "game"; }
 
@@ -62,7 +62,6 @@ private:
 	UI::EventReturn OnSetBackground(UI::EventParams &e);
 
 	// As we load metadata in the background, we need to be able to update these after the fact.
-	UI::TextureView *texvGameIcon_;
 	UI::TextView *tvTitle_;
 	UI::TextView *tvGameSize_;
 	UI::TextView *tvSaveDataSize_;

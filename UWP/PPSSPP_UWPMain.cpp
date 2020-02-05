@@ -36,11 +36,13 @@ using namespace Windows::Storage;
 using namespace Windows::Storage::Streams;
 using namespace Windows::System::Threading;
 using namespace Windows::ApplicationModel::DataTransfer;
+using namespace Windows::Devices::Enumeration;
 using namespace Concurrency;
 
 // UGLY!
 PPSSPP_UWPMain *g_main;
 extern WindowsAudioBackend *winAudioBackend;
+std::string langRegion;
 // TODO: Use Microsoft::WRL::ComPtr<> for D3D11 objects?
 // TODO: See https://github.com/Microsoft/Windows-universal-samples/tree/master/Samples/WindowsAudioSession for WASAPI with UWP
 // TODO: Low latency input: https://github.com/Microsoft/Windows-universal-samples/tree/master/Samples/LowLatencyInput/cpp
@@ -75,7 +77,6 @@ PPSSPP_UWPMain::PPSSPP_UWPMain(App ^app, const std::shared_ptr<DX::DeviceResourc
 
 	wchar_t lcCountry[256];
 
-	std::string langRegion;
 	if (0 != GetLocaleInfoEx(LOCALE_NAME_USER_DEFAULT, LOCALE_SNAME, lcCountry, 256)) {
 		langRegion = ConvertWStringToUTF8(lcCountry);
 		for (size_t i = 0; i < langRegion.size(); i++) {
@@ -120,7 +121,7 @@ PPSSPP_UWPMain::PPSSPP_UWPMain(App ^app, const std::shared_ptr<DX::DeviceResourc
 
 	std::string cacheFolder = ConvertWStringToUTF8(ApplicationData::Current->LocalFolder->Path->Data());
 
-	NativeInit(1, argv, "", "", cacheFolder.c_str(), false);
+	NativeInit(1, argv, "", "", cacheFolder.c_str());
 
 	NativeInitGraphics(ctx_.get());
 	NativeResized();
@@ -169,12 +170,6 @@ bool PPSSPP_UWPMain::Render() {
 	time_update();
 	auto context = m_deviceResources->GetD3DDeviceContext();
 
-	auto bounds = Windows::UI::ViewManagement::ApplicationView::GetForCurrentView()->VisibleBounds;
-
-	int boundTop = bounds.Top;
-	int boundLeft = bounds.Left;
-	int boundedWidth = bounds.Width;
-	int boundedHeight = bounds.Height;
 
 	switch (m_deviceResources->ComputeDisplayRotation()) {
 	case DXGI_MODE_ROTATION_IDENTITY: g_display_rotation = DisplayRotation::ROTATE_0; break;
@@ -197,8 +192,6 @@ bool PPSSPP_UWPMain::Render() {
 	}
 
 	g_dpi = m_deviceResources->GetActualDpi();
-	pixel_xres = (g_dpi / 96.0f) * boundedWidth;
-	pixel_yres = (g_dpi / 96.0f) * boundedHeight;
 
 	if (System_GetPropertyInt(SYSPROP_DEVICE_TYPE) == DEVICE_TYPE_MOBILE) {
 		// Boost DPI a bit to look better.
@@ -322,8 +315,10 @@ void PPSSPP_UWPMain::LoadStorageFile(StorageFile ^file) {
 }
 
 UWPGraphicsContext::UWPGraphicsContext(std::shared_ptr<DX::DeviceResources> resources) {
+	std::vector<std::string> adapterNames;
+
 	draw_ = Draw::T3DCreateD3D11Context(
-		resources->GetD3DDevice(), resources->GetD3DDeviceContext(), resources->GetD3DDevice(), resources->GetD3DDeviceContext(), resources->GetDeviceFeatureLevel(), 0);
+		resources->GetD3DDevice(), resources->GetD3DDeviceContext(), resources->GetD3DDevice(), resources->GetD3DDeviceContext(), resources->GetDeviceFeatureLevel(), 0, adapterNames);
 	bool success = draw_->CreatePresets();
 	assert(success);
 }
@@ -342,7 +337,7 @@ std::string System_GetProperty(SystemProperty prop) {
 	case SYSPROP_NAME:
 		return "Windows 10 Universal";
 	case SYSPROP_LANGREGION:
-		return "en_US";  // TODO UWP
+		return langRegion;
 	case SYSPROP_CLIPBOARD_TEXT:
 		/* TODO: Need to either change this API or do this on a thread in an ugly fashion.
 		DataPackageView ^view = Clipboard::GetContent();
@@ -365,12 +360,16 @@ int System_GetPropertyInt(SystemProperty prop) {
 	case SYSPROP_DISPLAY_REFRESH_RATE:
 		return 60000;
 	case SYSPROP_DEVICE_TYPE:
-		// TODO: Detect touch screen instead.
-#ifdef _M_ARM
-		return DEVICE_TYPE_MOBILE;
-#else
-		return DEVICE_TYPE_DESKTOP;
-#endif
+	{
+		auto ver = Windows::System::Profile::AnalyticsInfo::VersionInfo;
+		if (ver->DeviceFamily == "Windows.Mobile") {
+			return DEVICE_TYPE_MOBILE;
+		} else if (ver->DeviceFamily == "Windows.Xbox") {
+			return DEVICE_TYPE_TV;
+		} else {
+			return DEVICE_TYPE_DESKTOP;
+		}
+	}
 	default:
 		return -1;
 	}
@@ -422,7 +421,19 @@ void System_SendMessage(const char *command, const char *parameter) {
 				g_main->LoadStorageFile(file);
 			}
 		});
+	} else if (!strcmp(command, "toggle_fullscreen")) {
+		auto view = Windows::UI::ViewManagement::ApplicationView::GetForCurrentView();
+		if (strcmp(parameter, "0") == 0) {
+			view->ExitFullScreenMode();
+		}
+		else if (strcmp(parameter, "1") == 0){
+			view->TryEnterFullScreenMode();
+		}
 	}
+}
+
+void OpenDirectory(const char *path) {
+	// Unsupported
 }
 
 void LaunchBrowser(const char *url) {
@@ -461,6 +472,61 @@ bool System_InputBoxGetString(const char *title, const char *defaultValue, char 
 
 bool System_InputBoxGetWString(const wchar_t *title, const std::wstring &defaultvalue, std::wstring &outvalue) {
 	return false;
+}
+
+std::string GetCPUBrandString() {
+	Platform::String^ cpu_id = nullptr;
+	Platform::String^ cpu_name = nullptr;
+	
+	// GUID_DEVICE_PROCESSOR: {97FADB10-4E33-40AE-359C-8BEF029DBDD0}
+	Platform::String^ if_filter = L"System.Devices.InterfaceClassGuid:=\"{97FADB10-4E33-40AE-359C-8BEF029DBDD0}\"";
+
+	// Enumerate all CPU DeviceInterfaces, and get DeviceInstanceID of the first one.
+	auto if_task = create_task(
+		DeviceInformation::FindAllAsync(if_filter)).then([&](DeviceInformationCollection ^ collection) {
+			if (collection->Size > 0) {
+				auto cpu = collection->GetAt(0);
+				auto id = cpu->Properties->Lookup(L"System.Devices.DeviceInstanceID");
+				cpu_id = dynamic_cast<Platform::String^>(id);
+			}
+	});
+
+	try {
+		if_task.wait();
+	}
+	catch (const std::exception & e) {
+		const char* what = e.what();
+		ILOG("%s", what);
+	}
+
+	if (cpu_id != nullptr) {
+		// Get the Device with the same ID as the DeviceInterface
+		// Then get the name (description) of that Device
+		// We have to do this because the DeviceInterface we get doesn't have a proper description.
+		Platform::String^ dev_filter = L"System.Devices.DeviceInstanceID:=\"" + cpu_id + L"\"";
+
+		auto dev_task = create_task(
+			DeviceInformation::FindAllAsync(dev_filter, {}, DeviceInformationKind::Device)).then(
+				[&](DeviceInformationCollection ^ collection) {
+					if (collection->Size > 0) {
+						cpu_name = collection->GetAt(0)->Name;
+					}
+		});
+
+		try {
+			dev_task.wait();
+		}
+		catch (const std::exception & e) {
+			const char* what = e.what();
+			ILOG("%s", what);
+		}
+	}
+
+	if (cpu_name != nullptr) {
+		return FromPlatformString(cpu_name);
+	} else {
+		return "Unknown";
+	}
 }
 
 // Emulation of TlsAlloc for Windows 10. Used by glslang. Doesn't actually seem to work, other than fixing the linking errors?

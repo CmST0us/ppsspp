@@ -507,13 +507,12 @@ void LogoScreen::render() {
 	int ppsspp_org_y = yres / 2 + 130;
 	dc.DrawText("www.ppsspp.org", bounds.centerX(), ppsspp_org_y, textColor, ALIGN_CENTER);
 
-#if (defined(_WIN32) && !PPSSPP_PLATFORM(UWP)) || PPSSPP_PLATFORM(ANDROID)
+#if (defined(_WIN32) && !PPSSPP_PLATFORM(UWP)) || PPSSPP_PLATFORM(ANDROID) || PPSSPP_PLATFORM(LINUX)
 	// Draw the graphics API, except on UWP where it's always D3D11
 	std::string apiName = screenManager()->getDrawContext()->GetInfoString(InfoField::APINAME);
 	dc.DrawText(gr->T(apiName), bounds.centerX(), ppsspp_org_y + 50, textColor, ALIGN_CENTER);
 #endif
 
-	dc.End();
 	dc.Flush();
 }
 
@@ -611,6 +610,28 @@ void CreditsScreen::render() {
 
 	I18NCategory *cr = GetI18NCategory("PSPCredits");
 
+	std::string specialthanksMaxim = "Maxim ";
+	specialthanksMaxim += cr->T("specialthanksMaxim", "for his amazing Atrac3+ decoder work");
+
+	std::string specialthanksKeithGalocy = "Keith Galocy ";
+	specialthanksKeithGalocy += cr->T("specialthanksKeithGalocy", "at NVIDIA (hardware, advice)");
+
+	std::string specialthanksOrphis = "Orphis (";
+	specialthanksOrphis += cr->T("build server");
+	specialthanksOrphis += ')';
+
+	std::string specialthanksangelxwind = "angelxwind (";
+	specialthanksangelxwind += cr->T("iOS builds");
+	specialthanksangelxwind += ')';
+
+	std::string specialthanksW_MS = "W.MS (";
+	specialthanksW_MS += cr->T("iOS builds");
+	specialthanksW_MS += ')';
+
+	std::string specialthankssolarmystic = "solarmystic (";
+	specialthankssolarmystic += cr->T("testing");
+	specialthankssolarmystic += ')';
+
 	const char * credits[] = {
 		"PPSSPP",
 		"",
@@ -664,13 +685,13 @@ void CreditsScreen::render() {
 		"zminhquanz",
 		"",
 		cr->T("specialthanks", "Special thanks to:"),
-		"Maxim for his amazing Atrac3+ decoder work",
-		"Keith Galocy at nVidia (hw, advice)",
-		"Orphis (build server)",
-		"angelxwind (iOS builds)",
-		"W.MS (iOS builds)",
-		"solarmystic (testing)",
-		"all the forum mods",
+		specialthanksMaxim.c_str(),
+		specialthanksKeithGalocy.c_str(),
+		specialthanksOrphis.c_str(),
+		specialthanksangelxwind.c_str(),
+		specialthanksW_MS.c_str(),
+		specialthankssolarmystic.c_str(),
+		cr->T("all the forum mods"),
 		"",
 		cr->T("this translation by", ""),   // Empty string as this is the original :)
 		cr->T("translators1", ""),
@@ -746,6 +767,5 @@ void CreditsScreen::render() {
 		y += itemHeight;
 	}
 
-	dc.End();
 	dc.Flush();
 }

@@ -64,8 +64,7 @@ private:
 
 	GLRenderManager *render_;
 	bool useGL3_;
-	bool vertexShaderFailed_;
-	GLRShader *vertexShader_;
+	GLRShader *vertexShader_ = nullptr;
 	std::map<u32, DepalShader *> cache_;
 	std::map<u32, DepalTexture *> texCache_;
 };

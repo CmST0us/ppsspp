@@ -23,6 +23,8 @@ Debug
 Release
 Windows/.vs
 Windows/x64
+Windows/ARM
+Windows/ARM64
 Windows/ipch
 Windows/bin-release
 Windows/win-version.h
@@ -33,12 +35,19 @@ ext/_Output
 android/lint.xml
 PPSSPPWindows64.exe.manifest
 PPSSPPWindows.exe.manifest
+PPSSPPWindowsARM64.exe.manifest
+PPSSPPWindowsARM.exe.manifest
 PPSSPPDebug64.exe.manifest
 PPSSPPDebug.exe.manifest
+PPSSPPDebugARM64.exe.manifest
+PPSSPPDebugARM.exe.manifest
 assets/flash0
 UWP/icph
+UWP/Content/*
+!UWP/Content/.empty
 UWP/.vs
 .vs
+.vscode
 
 # For Mac
 .DS_Store
@@ -65,7 +74,7 @@ desc.txt
 
 Logs
 Memstick
-memstick
+memstick*
 Cheats
 
 /git-version.cpp
@@ -82,6 +91,7 @@ android/assets/lang
 android/assets/flash0
 ppge_atlas.zim.png
 local.properties
+r.sh
 
 # For vim
 *.swp
@@ -101,3 +111,6 @@ debian/ppsspp/
 
 # YouCompleteMe file
 .ycm_extra_conf.pyc
+
+# RenderDoc
+*.rdc

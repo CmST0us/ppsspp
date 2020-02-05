@@ -60,9 +60,22 @@ void DispatchEvents() {
 }
 
 void RemoveQueuedEvents(View *v) {
-	for (size_t i = 0; i < g_dispatchQueue.size(); i++) {
-		if (g_dispatchQueue[i].params.v == v)
-			g_dispatchQueue.erase(g_dispatchQueue.begin() + i);
+	for (auto it = g_dispatchQueue.begin(); it != g_dispatchQueue.end(); ) {
+		if (it->params.v == v) {
+			it = g_dispatchQueue.erase(it);
+		} else {
+			++it;
+		}
+	}
+}
+
+void RemoveQueuedEvents(Event *e) {
+	for (auto it = g_dispatchQueue.begin(); it != g_dispatchQueue.end(); ) {
+		if (it->e == e) {
+			it = g_dispatchQueue.erase(it);
+		} else {
+			++it;
+		}
 	}
 }
 
@@ -155,6 +168,11 @@ EventReturn Event::Dispatch(EventParams &e) {
 		}
 	}
 	return UI::EVENT_SKIPPED;
+}
+
+Event::~Event() {
+	handlers_.clear();
+	RemoveQueuedEvents(this);
 }
 
 View::~View() {
@@ -346,6 +364,8 @@ bool IsDPadKey(const KeyInput &key) {
 
 bool IsAcceptKey(const KeyInput &key) {
 	if (confirmKeys.empty()) {
+		// This path is pretty much not used, confirmKeys should be set.
+		// TODO: Get rid of this stuff?
 		if (key.deviceId == DEVICE_ID_KEYBOARD) {
 			return key.keyCode == NKCODE_SPACE || key.keyCode == NKCODE_ENTER || key.keyCode == NKCODE_Z;
 		} else {
@@ -358,6 +378,8 @@ bool IsAcceptKey(const KeyInput &key) {
 
 bool IsEscapeKey(const KeyInput &key) {
 	if (cancelKeys.empty()) {
+		// This path is pretty much not used, cancelKeys should be set.
+		// TODO: Get rid of this stuff?
 		if (key.deviceId == DEVICE_ID_KEYBOARD) {
 			return key.keyCode == NKCODE_ESCAPE || key.keyCode == NKCODE_BACK;
 		} else {
@@ -370,6 +392,8 @@ bool IsEscapeKey(const KeyInput &key) {
 
 bool IsTabLeftKey(const KeyInput &key) {
 	if (tabLeftKeys.empty()) {
+		// This path is pretty much not used, tabLeftKeys should be set.
+		// TODO: Get rid of this stuff?
 		return key.keyCode == NKCODE_BUTTON_L1;
 	} else {
 		return MatchesKeyDef(tabLeftKeys, key);
@@ -378,6 +402,8 @@ bool IsTabLeftKey(const KeyInput &key) {
 
 bool IsTabRightKey(const KeyInput &key) {
 	if (tabRightKeys.empty()) {
+		// This path is pretty much not used, tabRightKeys should be set.
+		// TODO: Get rid of this stuff?
 		return key.keyCode == NKCODE_BUTTON_R1;
 	} else {
 		return MatchesKeyDef(tabRightKeys, key);
@@ -390,6 +416,7 @@ bool Clickable::Key(const KeyInput &key) {
 		return false;
 	}
 	// TODO: Replace most of Update with this.
+
 	bool ret = false;
 	if (key.flags & KEY_DOWN) {
 		if (IsAcceptKey(key)) {
@@ -658,10 +685,16 @@ void PopupHeader::Draw(UIContext &dc) {
 	}
 }
 
-void CheckBox::Toggle(){
+void CheckBox::Toggle() {
 	if (toggle_)
 		*toggle_ = !(*toggle_);
-};
+}
+
+bool CheckBox::Toggled() const {
+	if (toggle_)
+		return *toggle_;
+	return false;
+}
 
 EventReturn CheckBox::OnClicked(EventParams &e) {
 	Toggle();
@@ -676,7 +709,7 @@ void CheckBox::Draw(UIContext &dc) {
 
 	ClickableItem::Draw(dc);
 
-	int image = *toggle_ ? dc.theme->checkOn : dc.theme->checkOff;
+	int image = Toggled() ? dc.theme->checkOn : dc.theme->checkOff;
 	float imageW, imageH;
 	dc.Draw()->MeasureImage(image, &imageW, &imageH);
 
@@ -703,7 +736,7 @@ float CheckBox::CalculateTextScale(const UIContext &dc, float availWidth) const 
 }
 
 void CheckBox::GetContentDimensions(const UIContext &dc, float &w, float &h) const {
-	int image = *toggle_ ? dc.theme->checkOn : dc.theme->checkOff;
+	int image = Toggled() ? dc.theme->checkOn : dc.theme->checkOff;
 	float imageW, imageH;
 	dc.Draw()->MeasureImage(image, &imageW, &imageH);
 
@@ -722,6 +755,17 @@ void CheckBox::GetContentDimensions(const UIContext &dc, float &w, float &h) con
 
 	w = bounds_.w;
 	h = std::max(actualHeight, ITEM_HEIGHT);
+}
+
+void BitCheckBox::Toggle() {
+	if (bitfield_)
+		*bitfield_ = *bitfield_ ^ bit_;
+}
+
+bool BitCheckBox::Toggled() const {
+	if (bitfield_)
+		return (bit_ & *bitfield_) == bit_;
+	return false;
 }
 
 void Button::GetContentDimensions(const UIContext &dc, float &w, float &h) const {
@@ -778,28 +822,6 @@ void ImageView::Draw(UIContext &dc) {
 	// TODO: involve sizemode
 	float scale = bounds_.w / img.w;
 	dc.Draw()->DrawImage(atlasImage_, bounds_.x, bounds_.y, scale, 0xFFFFFFFF, ALIGN_TOPLEFT);
-}
-
-void TextureView::GetContentDimensions(const UIContext &dc, float &w, float &h) const {
-	// TODO: involve sizemode
-	if (texture_) {
-		w = (float)texture_->Width();
-		h = (float)texture_->Height();
-	} else {
-		w = 16;
-		h = 16;
-	}
-}
-
-void TextureView::Draw(UIContext &dc) {
-	// TODO: involve sizemode
-	if (texture_) {
-		dc.Flush();
-		dc.GetDrawContext()->BindTexture(0, texture_);
-		dc.Draw()->Rect(bounds_.x, bounds_.y, bounds_.w, bounds_.h, color_);
-		dc.Flush();
-		dc.RebindTexture();
-	}
 }
 
 void TextView::GetContentDimensionsBySpec(const UIContext &dc, MeasureSpec horiz, MeasureSpec vert, float &w, float &h) const {
@@ -923,7 +945,7 @@ bool TextEdit::Key(const KeyInput &input) {
 	if (!HasFocus())
 		return false;
 	bool textChanged = false;
-	// Process navigation keys. These aren't chars.
+	// Process hardcoded navigation keys. These aren't chars.
 	if (input.flags & KEY_DOWN) {
 		switch (input.keyCode) {
 		case NKCODE_CTRL_LEFT:

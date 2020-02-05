@@ -35,13 +35,12 @@
 #include "thread/threadutil.h"
 #include "util/text/utf8.h"
 
+#include "Common/GraphicsContext.h"
 #include "Core/MemMap.h"
 #include "Core/HDRemaster.h"
-
 #include "Core/MIPS/MIPS.h"
 #include "Core/MIPS/MIPSAnalyst.h"
-
-#include "Debugger/SymbolMap.h"
+#include "Core/Debugger/SymbolMap.h"
 #include "Core/Host.h"
 #include "Core/System.h"
 #include "Core/HLE/HLE.h"
@@ -82,6 +81,9 @@ ParamSFOData g_paramSFO;
 static GlobalUIState globalUIState;
 static CoreParameter coreParameter;
 static FileLoader *loadedFile;
+// For background loading thread.
+static std::mutex loadingLock;
+// For loadingReason updates.
 static std::mutex loadingReasonLock;
 static std::string loadingReason;
 
@@ -255,7 +257,18 @@ void CPU_Init() {
 	}
 }
 
+PSP_LoadingLock::PSP_LoadingLock() {
+	loadingLock.lock();
+}
+
+PSP_LoadingLock::~PSP_LoadingLock() {
+	loadingLock.unlock();
+}
+
 void CPU_Shutdown() {
+	// Since we load on a background thread, wait for startup to complete.
+	PSP_LoadingLock lock;
+
 	if (g_Config.bAutoSaveSymbolMap) {
 		host->SaveSymbolMap();
 	}
@@ -357,7 +370,8 @@ bool PSP_InitUpdate(std::string *error_string) {
 	*error_string = coreParameter.errorString;
 	if (success && gpu == nullptr) {
 		PSP_SetLoading("Starting graphics...");
-		success = GPU_Init(coreParameter.graphicsContext, coreParameter.thin3d);
+		Draw::DrawContext *draw = coreParameter.graphicsContext ? coreParameter.graphicsContext->GetDrawContext() : nullptr;
+		success = GPU_Init(coreParameter.graphicsContext, draw);
 		if (!success) {
 			*error_string = "Unable to initialize rendering engine.";
 		}

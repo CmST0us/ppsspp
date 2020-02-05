@@ -51,7 +51,9 @@
 #include "Windows/WindowsHost.h"
 #include "Windows/MainWindow.h"
 
+#if PPSSPP_API(ANY_GL)
 #include "Windows/GPU/WindowsGLContext.h"
+#endif
 #include "Windows/GPU/WindowsVulkanContext.h"
 #include "Windows/GPU/D3D9Context.h"
 #include "Windows/GPU/D3D11Context.h"
@@ -60,9 +62,10 @@
 #include "Windows/Debugger/Debugger_Disasm.h"
 #include "Windows/Debugger/Debugger_MemoryDlg.h"
 
+#ifndef _M_ARM
 #include "Windows/DinputDevice.h"
+#endif
 #include "Windows/XinputDevice.h"
-#include "Windows/KeyboardDevice.h"
 
 #include "Windows/main.h"
 #include "UI/OnScreenDisplay.h"
@@ -85,15 +88,14 @@ WindowsHost::WindowsHost(HINSTANCE hInstance, HWND mainWindow, HWND displayWindo
 	g_mouseDeltaY = 0;
 
 	//add first XInput device to respond
-	input.push_back(std::shared_ptr<InputDevice>(new XinputDevice()));
+	input.push_back(std::make_unique<XinputDevice>());
+#ifndef _M_ARM
 	//find all connected DInput devices of class GamePad
 	numDinputDevices_ = DinputDevice::getNumPads();
 	for (size_t i = 0; i < numDinputDevices_; i++) {
-		input.push_back(std::shared_ptr<InputDevice>(new DinputDevice(static_cast<int>(i))));
+		input.push_back(std::make_unique<DinputDevice>(static_cast<int>(i)));
 	}
-	keyboard = std::shared_ptr<KeyboardDevice>(new KeyboardDevice());
-	input.push_back(keyboard);
-
+#endif
 	SetConsolePosition();
 }
 
@@ -115,9 +117,11 @@ void WindowsHost::UpdateConsolePosition() {
 bool WindowsHost::InitGraphics(std::string *error_message, GraphicsContext **ctx) {
 	WindowsGraphicsContext *graphicsContext = nullptr;
 	switch (g_Config.iGPUBackend) {
+#if PPSSPP_API(ANY_GL)
 	case (int)GPUBackend::OPENGL:
 		graphicsContext = new WindowsGLContext();
 		break;
+#endif
 	case (int)GPUBackend::DIRECT3D9:
 		graphicsContext = new D3D9Context();
 		break;
@@ -208,24 +212,22 @@ void WindowsHost::PollControllers() {
 	static int checkCounter = 0;
 	static const int CHECK_FREQUENCY = 71;
 	if (checkCounter++ > CHECK_FREQUENCY) {
+#ifndef _M_ARM
 		size_t newCount = DinputDevice::getNumPads();
 		if (newCount > numDinputDevices_) {
 			INFO_LOG(SYSTEM, "New controller device detected");
 			for (size_t i = numDinputDevices_; i < newCount; i++) {
-				input.push_back(std::shared_ptr<InputDevice>(new DinputDevice(static_cast<int>(i))));
+				input.push_back(std::make_unique<DinputDevice>(static_cast<int>(i)));
 			}
 			numDinputDevices_ = newCount;
 		}
-
+#endif
 		checkCounter = 0;
 	}
 
-	bool doPad = true;
 	for (const auto &device : input) {
-		if (!doPad && device->IsPad())
-			continue;
 		if (device->UpdateState() == InputDevice::UPDATESTATE_SKIP_PAD)
-			doPad = false;
+			break;
 	}
 
 	// Disabled by default, needs a workaround to map to psp keys.
@@ -244,8 +246,8 @@ void WindowsHost::PollControllers() {
 		axisY.value = my;
 
 		if (GetUIState() == UISTATE_INGAME || g_Config.bMapMouse) {
-			if (fabsf(mx) > 0.01f) NativeAxis(axisX);
-			if (fabsf(my) > 0.01f) NativeAxis(axisY);
+			NativeAxis(axisX);
+			NativeAxis(axisY);
 		}
 	}
 

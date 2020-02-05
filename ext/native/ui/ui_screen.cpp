@@ -78,9 +78,9 @@ void UIScreen::preRender() {
 		return;
 	}
 	draw->BeginFrame();
-	screenManager()->getUIContext()->BeginFrame();
 	// Bind and clear the back buffer
 	draw->BindFramebufferAsRenderTarget(nullptr, { RPAction::CLEAR, RPAction::CLEAR, RPAction::CLEAR, 0xFF000000 });
+	screenManager()->getUIContext()->BeginFrame();
 
 	Draw::Viewport viewport;
 	viewport.TopLeftX = 0;
@@ -113,7 +113,6 @@ void UIScreen::render() {
 		uiContext->Begin();
 		DrawBackground(*uiContext);
 		root_->Draw(*uiContext);
-		uiContext->End();
 		uiContext->Flush();
 
 		uiContext->PopTransform();
@@ -269,6 +268,9 @@ bool PopupScreen::key(const KeyInput &key) {
 void PopupScreen::update() {
 	UIDialogScreen::update();
 
+	if (defaultButton_)
+		defaultButton_->SetEnabled(CanComplete(DR_OK));
+
 	float animatePos = 1.0f;
 
 	++frames_;
@@ -315,10 +317,12 @@ void PopupScreen::SetPopupOrigin(const UI::View *view) {
 }
 
 void PopupScreen::TriggerFinish(DialogResult result) {
-	finishFrame_ = frames_;
-	finishResult_ = result;
+	if (CanComplete(result)) {
+		finishFrame_ = frames_;
+		finishResult_ = result;
 
-	OnCompleted(result);
+		OnCompleted(result);
+	}
 }
 
 void PopupScreen::resized() {

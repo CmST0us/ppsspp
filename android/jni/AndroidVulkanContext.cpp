@@ -92,9 +92,16 @@ bool AndroidVulkanContext::InitAPI() {
 	ILOG("Creating Vulkan context");
 	Version gitVer(PPSSPP_GIT_VERSION);
 
+	if (!VulkanLoad()) {
+		ELOG("Failed to load Vulkan driver library");
+		return false;
+	}
+
 	if (!g_Vulkan) {
+		// TODO: Assert if g_Vulkan already exists here?
 		g_Vulkan = new VulkanContext();
 	}
+
 	VulkanContext::CreateInfo info{};
 	info.app_name = "PPSSPP";
 	info.app_ver = gitVer.ToInteger();
@@ -102,7 +109,6 @@ bool AndroidVulkanContext::InitAPI() {
 	VkResult res = g_Vulkan->CreateInstance(info);
 	if (res != VK_SUCCESS) {
 		ELOG("Failed to create vulkan context: %s", g_Vulkan->InitError().c_str());
-		System_SendMessage("toast", "No Vulkan compatible device found. Using OpenGL instead.");
 		VulkanSetAvailable(false);
 		delete g_Vulkan;
 		g_Vulkan = nullptr;
@@ -130,18 +136,23 @@ bool AndroidVulkanContext::InitAPI() {
 		g_Vulkan = nullptr;
 		return false;
 	}
+	ILOG("Vulkan device created!");
 	return true;
 }
 
 bool AndroidVulkanContext::InitFromRenderThread(ANativeWindow *wnd, int desiredBackbufferSizeX, int desiredBackbufferSizeY, int backbufferFormat, int androidVersion) {
-	int width = desiredBackbufferSizeX;
-	int height = desiredBackbufferSizeY;
-	if (!width || !height) {
-		width = pixel_xres;
-		height = pixel_yres;
+	ILOG("AndroidVulkanContext::InitFromRenderThread: desiredwidth=%d desiredheight=%d", desiredBackbufferSizeX, desiredBackbufferSizeY);
+	if (!g_Vulkan) {
+		ELOG("AndroidVulkanContext::InitFromRenderThread: No Vulkan context");
+		return false;
 	}
-	ILOG("InitSurfaceAndroid: width=%d height=%d", width, height);
-	g_Vulkan->InitSurface(WINDOWSYSTEM_ANDROID, (void *)wnd, nullptr, width, height);
+
+	VkResult res = g_Vulkan->InitSurface(WINDOWSYSTEM_ANDROID, (void *)wnd, nullptr);
+	if (res != VK_SUCCESS) {
+		ELOG("g_Vulkan->InitSurface failed: '%s'", VulkanResultToString(res));
+		return false;
+	}
+
 	if (g_validate_) {
 		int bits = VK_DEBUG_REPORT_ERROR_BIT_EXT | VK_DEBUG_REPORT_WARNING_BIT_EXT | VK_DEBUG_REPORT_PERFORMANCE_WARNING_BIT_EXT;
 		g_Vulkan->InitDebugMsgCallback(&Vulkan_Dbg, bits, &g_LogOptions);
@@ -152,7 +163,7 @@ bool AndroidVulkanContext::InitFromRenderThread(ANativeWindow *wnd, int desiredB
 		draw_ = Draw::T3DCreateVulkanContext(g_Vulkan, g_Config.bGfxDebugSplitSubmit);
 		SetGPUBackend(GPUBackend::VULKAN);
 		success = draw_->CreatePresets();  // Doesn't fail, we ship the compiler.
-		assert(success);
+		_assert_msg_(G3D, success, "Failed to compile preset shaders");
 		draw_->HandleEvent(Draw::Event::GOT_BACKBUFFER, g_Vulkan->GetBackbufferWidth(), g_Vulkan->GetBackbufferHeight());
 
 		VulkanRenderManager *renderManager = (VulkanRenderManager *)draw_->GetNativeObject(Draw::NativeObject::RENDER_MANAGER);
@@ -165,6 +176,7 @@ bool AndroidVulkanContext::InitFromRenderThread(ANativeWindow *wnd, int desiredB
 	if (!success) {
 		g_Vulkan->DestroyObjects();
 		g_Vulkan->DestroyDevice();
+		g_Vulkan->DestroyDebugUtilsCallback();
 		g_Vulkan->DestroyDebugMsgCallback();
 
 		g_Vulkan->DestroyInstance();
@@ -186,6 +198,7 @@ void AndroidVulkanContext::ShutdownFromRenderThread() {
 void AndroidVulkanContext::Shutdown() {
 	ILOG("Calling NativeShutdownGraphics");
 	g_Vulkan->DestroyDevice();
+	g_Vulkan->DestroyDebugUtilsCallback();
 	g_Vulkan->DestroyDebugMsgCallback();
 
 	g_Vulkan->DestroyInstance();
@@ -198,16 +211,16 @@ void AndroidVulkanContext::SwapBuffers() {
 }
 
 void AndroidVulkanContext::Resize() {
-	ILOG("AndroidVulkanContext::Resize begin (%d, %d)", g_Vulkan->GetBackbufferWidth(), g_Vulkan->GetBackbufferHeight());
+	ILOG("AndroidVulkanContext::Resize begin (oldsize: %dx%d)", g_Vulkan->GetBackbufferWidth(), g_Vulkan->GetBackbufferHeight());
 
 	draw_->HandleEvent(Draw::Event::LOST_BACKBUFFER, g_Vulkan->GetBackbufferWidth(), g_Vulkan->GetBackbufferHeight());
 	g_Vulkan->DestroyObjects();
 
 	// backbufferResize updated these values.	TODO: Notify another way?
-	g_Vulkan->ReinitSurface(pixel_xres, pixel_yres);
+	g_Vulkan->ReinitSurface();
 	g_Vulkan->InitObjects();
 	draw_->HandleEvent(Draw::Event::GOT_BACKBUFFER, g_Vulkan->GetBackbufferWidth(), g_Vulkan->GetBackbufferHeight());
-	ILOG("AndroidVulkanContext::Resize end (%d, %d)", g_Vulkan->GetBackbufferWidth(), g_Vulkan->GetBackbufferHeight());
+	ILOG("AndroidVulkanContext::Resize end (final size: %dx%d)", g_Vulkan->GetBackbufferWidth(), g_Vulkan->GetBackbufferHeight());
 }
 
 void AndroidVulkanContext::SwapInterval(int interval) {

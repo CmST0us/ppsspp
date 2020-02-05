@@ -1,6 +1,5 @@
 // SDL/EGL implementation of the framework.
 // This is quite messy due to platform-specific implementations and #ifdef's.
-// Note: SDL1.2 implementation is deprecated and will soon be replaced by SDL2.0.
 // If your platform is not supported, it is suggested to use Qt instead.
 
 #include <unistd.h>
@@ -28,7 +27,7 @@ SDLJoystick *joystick = NULL;
 #include "input/input_state.h"
 #include "input/keycodes.h"
 #include "net/resolve.h"
-#include "base/NKCodeFromSDL.h"
+#include "NKCodeFromSDL.h"
 #include "util/const_map.h"
 #include "util/text/utf8.h"
 #include "math/math_util.h"
@@ -116,11 +115,26 @@ void System_SendMessage(const char *command, const char *parameter) {
 	} else if (!strcmp(command, "finish")) {
 		// Do a clean exit
 		g_QuitRequested = true;
+	} else if (!strcmp(command, "graphics_restart")) {
+		// Not sure how we best do this, but do a clean exit, better than being stuck in a bad state.
+		g_QuitRequested = true;
+	} else if (!strcmp(command, "setclipboardtext")) {
+		SDL_SetClipboardText(parameter);
 	}
 }
 
 void System_AskForPermission(SystemPermission permission) {}
 PermissionStatus System_GetPermissionStatus(SystemPermission permission) { return PERMISSION_STATUS_GRANTED; }
+
+void OpenDirectory(const char *path) {
+#if defined(_WIN32)
+	PIDLIST_ABSOLUTE pidl = ILCreateFromPath(ConvertUTF8ToWString(ReplaceAll(path, "/", "\\")).c_str());
+	if (pidl) {
+		SHOpenFolderAndSelectItems(pidl, 0, NULL, 0);
+		ILFree(pidl);
+	}
+#endif
+}
 
 void LaunchBrowser(const char *url) {
 #if defined(MOBILE_DEVICE)
@@ -205,6 +219,8 @@ std::string System_GetProperty(SystemProperty prop) {
 		}
 		return "en_US";
 	}
+	case SYSPROP_CLIPBOARD_TEXT:
+		return SDL_HasClipboardText() ? SDL_GetClipboardText() : "";
 	default:
 		return "";
 	}
@@ -348,9 +364,9 @@ int main(int argc, char *argv[]) {
 	SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS, "0");
 
 	if (VulkanMayBeAvailable()) {
-		printf("Vulkan might be available.\n");
+		printf("DEBUG: Vulkan might be available.\n");
 	} else {
-		printf("Vulkan is not available.\n");
+		printf("DEBUG: Vulkan is not available, not using Vulkan.\n");
 	}
 
 	int set_xres = -1;
@@ -410,12 +426,6 @@ int main(int argc, char *argv[]) {
 		}
 	}
 
-	// TODO: How do we get this into the GraphicsContext?
-#ifdef USING_EGL
-	if (EGL_Open())
-		return 1;
-#endif
-
 	// Get the video info before doing anything else, so we don't get skewed resolution results.
 	// TODO: support multiple displays correctly
 	SDL_DisplayMode displayMode;
@@ -433,18 +443,19 @@ int main(int argc, char *argv[]) {
 	SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
 	SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
 	SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
-	SDL_GL_SetSwapInterval(1);
 
-	// Is resolution is too low to run windowed
+	// Force fullscreen if the resolution is too low to run windowed.
 	if (g_DesktopWidth < 480 * 2 && g_DesktopHeight < 272 * 2) {
 		mode |= SDL_WINDOW_FULLSCREEN_DESKTOP;
 	}
 
 	// If we're on mobile, don't try for windowed either.
-#if defined(USING_GLES2) || defined(MOBILE_DEVICE)
-    mode |= SDL_WINDOW_FULLSCREEN;
+#if defined(MOBILE_DEVICE)
+	mode |= SDL_WINDOW_FULLSCREEN;
+#elif defined(USING_FBDEV)
+	mode |= SDL_WINDOW_FULLSCREEN_DESKTOP;
 #else
-    mode |= SDL_WINDOW_RESIZABLE;
+	mode |= SDL_WINDOW_RESIZABLE;
 #endif
 
 	if (mode & SDL_WINDOW_FULLSCREEN_DESKTOP) {
@@ -559,6 +570,9 @@ int main(int argc, char *argv[]) {
 		NativeResized();
 	}
 
+	// Ensure that the swap interval is set after context creation (needed for kmsdrm)
+	SDL_GL_SetSwapInterval(1);
+
 	SDL_AudioSpec fmt, ret_fmt;
 	memset(&fmt, 0, sizeof(fmt));
 	fmt.freq = 44100;
@@ -600,6 +614,7 @@ int main(int argc, char *argv[]) {
 	}
 	graphicsContext->ThreadStart();
 
+	bool windowHidden = false;
 	while (true) {
 		double startTime = time_now_d();
 		SDL_Event event, touchEvent;
@@ -615,14 +630,20 @@ int main(int argc, char *argv[]) {
 #if !defined(MOBILE_DEVICE)
 			case SDL_WINDOWEVENT:
 				switch (event.window.event) {
-				case SDL_WINDOWEVENT_RESIZED:
+				case SDL_WINDOWEVENT_SIZE_CHANGED:  // better than RESIZED, more general
+				case SDL_WINDOWEVENT_MAXIMIZED:
+				case SDL_WINDOWEVENT_RESTORED:
 				{
+					windowHidden = false;
+					Core_NotifyWindowHidden(windowHidden);
+
 					Uint32 window_flags = SDL_GetWindowFlags(window);
 					bool fullscreen = (window_flags & SDL_WINDOW_FULLSCREEN);
 
-					if (UpdateScreenScale(event.window.data1, event.window.data2)) {
-						NativeMessageReceived("gpu_resized", "");
+					if (event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
+						UpdateScreenScale(event.window.data1, event.window.data2);
 					}
+					NativeMessageReceived("gpu_resized", "");
 
 					// Set variable here in case fullscreen was toggled by hotkey
 					g_Config.bFullScreen = fullscreen;
@@ -636,6 +657,16 @@ int main(int argc, char *argv[]) {
 					break;
 				}
 
+				case SDL_WINDOWEVENT_MINIMIZED:
+				case SDL_WINDOWEVENT_HIDDEN:
+					windowHidden = true;
+					Core_NotifyWindowHidden(windowHidden);
+					break;
+				case SDL_WINDOWEVENT_EXPOSED:
+				case SDL_WINDOWEVENT_SHOWN:
+					windowHidden = false;
+					Core_NotifyWindowHidden(windowHidden);
+					break;
 				default:
 					break;
 				}
@@ -682,6 +713,8 @@ int main(int argc, char *argv[]) {
 					NativeKey(key);
 					break;
 				}
+// This behavior doesn't feel right on a macbook with a touchpad.
+#if !PPSSPP_PLATFORM(MAC)
 			case SDL_FINGERMOTION:
 				{
 					SDL_GetWindowSize(window, &w, &h);
@@ -744,6 +777,7 @@ int main(int argc, char *argv[]) {
 					SDL_PushEvent(&touchEvent);
 					break;
 				}
+#endif
 			case SDL_MOUSEBUTTONDOWN:
 				switch (event.button.button) {
 				case SDL_BUTTON_LEFT:
@@ -847,7 +881,8 @@ int main(int argc, char *argv[]) {
 			// glsl_refresh(); // auto-reloads modified GLSL shaders once per second.
 		}
 
-		if (emuThreadState != (int)EmuThreadState::DISABLED) {
+		bool renderThreadPaused = windowHidden && g_Config.bPauseWhenMinimized && emuThreadState != (int)EmuThreadState::DISABLED;
+		if (emuThreadState != (int)EmuThreadState::DISABLED && !renderThreadPaused) {
 			if (!graphicsContext->ThreadFrame())
 				break;
 		}
@@ -859,7 +894,7 @@ int main(int argc, char *argv[]) {
 
 		// Simple throttling to not burn the GPU in the menu.
 		time_update();
-		if (GetUIState() != UISTATE_INGAME || !PSP_IsInited()) {
+		if (GetUIState() != UISTATE_INGAME || !PSP_IsInited() || renderThreadPaused) {
 			double diffTime = time_now_d() - startTime;
 			int sleepTime = (int)(1000.0 / 60.0) - (int)(diffTime * 1000.0);
 			if (sleepTime > 0)

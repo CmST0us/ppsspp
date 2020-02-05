@@ -46,15 +46,6 @@ namespace Draw {
 	class Framebuffer;
 }
 
-struct CardboardSettings {
-	bool enabled;
-	float leftEyeXPosition;
-	float rightEyeXPosition;
-	float screenYPosition;
-	float screenWidth;
-	float screenHeight;
-};
-
 class VulkanFBO;
 
 struct PostShaderUniforms {
@@ -77,7 +68,7 @@ struct VirtualFramebuffer {
 	bool firstFrameSaved;
 
 	u32 fb_address;
-	u32 z_address;
+	u32 z_address;  // If 0, it's a "RAM" framebuffer.
 	int fb_stride;
 	int z_stride;
 
@@ -119,7 +110,6 @@ struct VirtualFramebuffer {
 };
 
 struct FramebufferHeuristicParams {
-	u32 fb_addr;
 	u32 fb_address;
 	int fb_stride;
 	u32 z_address;
@@ -147,6 +137,8 @@ enum BindFramebufferColorFlags {
 	BINDFBCOLOR_MAY_COPY = 1,
 	BINDFBCOLOR_MAY_COPY_WITH_UV = 3,
 	BINDFBCOLOR_APPLY_TEX_OFFSET = 4,
+	// Used when rendering to a temporary surface (e.g. not the current render target.)
+	BINDFBCOLOR_FORCE_SELF = 8,
 };
 
 enum DrawTextureFlags {
@@ -154,13 +146,20 @@ enum DrawTextureFlags {
 	DRAWTEX_LINEAR = 1,
 	DRAWTEX_KEEP_TEX = 2,
 	DRAWTEX_KEEP_STENCIL_ALPHA = 4,
+	DRAWTEX_TO_BACKBUFFER = 8,
 };
+
+inline DrawTextureFlags operator | (const DrawTextureFlags &lhs, const DrawTextureFlags &rhs) {
+	return DrawTextureFlags((u32)lhs | (u32)rhs);
+}
 
 enum class TempFBO {
 	DEPAL,
 	BLIT,
 	// For copies of framebuffers (e.g. shader blending.)
 	COPY,
+	// Used to copy stencil data, means we need a stencil backing.
+	STENCIL,
 };
 
 inline Draw::DataFormat GEFormatToThin3D(int geFormat) {
@@ -243,10 +242,10 @@ public:
 	size_t NumVFBs() const { return vfbs_.size(); }
 
 	u32 PrevDisplayFramebufAddr() {
-		return prevDisplayFramebuf_ ? (0x04000000 | prevDisplayFramebuf_->fb_address) : 0;
+		return prevDisplayFramebuf_ ? prevDisplayFramebuf_->fb_address : 0;
 	}
 	u32 DisplayFramebufAddr() {
-		return displayFramebuf_ ? (0x04000000 | displayFramebuf_->fb_address) : 0;
+		return displayFramebuf_ ? displayFramebuf_->fb_address : 0;
 	}
 
 	u32 DisplayFramebufStride() {
@@ -317,9 +316,6 @@ protected:
 	virtual void Bind2DShader() = 0;
 	virtual void BindPostShader(const PostShaderUniforms &uniforms) = 0;
 
-	// Cardboard Settings Calculator
-	void GetCardboardSettings(CardboardSettings *cardboardSettings);
-
 	bool UpdateSize();
 	void SetNumExtraFBOs(int num);
 
@@ -331,8 +327,7 @@ protected:
 	void CopyFramebufferForColorTexture(VirtualFramebuffer *dst, VirtualFramebuffer *src, int flags);
 
 	void EstimateDrawingSize(u32 fb_address, GEBufferFormat fb_format, int viewport_width, int viewport_height, int region_width, int region_height, int scissor_width, int scissor_height, int fb_stride, int &drawing_width, int &drawing_height);
-	u32 FramebufferByteSize(const VirtualFramebuffer *vfb) const;
-	static bool MaskedEqual(u32 addr1, u32 addr2);
+	u32 ColorBufferByteSize(const VirtualFramebuffer *vfb) const;
 
 	void NotifyRenderFramebufferCreated(VirtualFramebuffer *vfb);
 	void NotifyRenderFramebufferUpdated(VirtualFramebuffer *vfb, bool vfbFormatChanged);
@@ -346,10 +341,12 @@ protected:
 
 	bool ShouldDownloadFramebuffer(const VirtualFramebuffer *vfb) const;
 	void DownloadFramebufferOnSwitch(VirtualFramebuffer *vfb);
-	void FindTransferFramebuffers(VirtualFramebuffer *&dstBuffer, VirtualFramebuffer *&srcBuffer, u32 dstBasePtr, int dstStride, int &dstX, int &dstY, u32 srcBasePtr, int srcStride, int &srcX, int &srcY, int &srcWidth, int &srcHeight, int &dstWidth, int &dstHeight, int bpp) const;
+	void FindTransferFramebuffers(VirtualFramebuffer *&dstBuffer, VirtualFramebuffer *&srcBuffer, u32 dstBasePtr, int dstStride, int &dstX, int &dstY, u32 srcBasePtr, int srcStride, int &srcX, int &srcY, int &srcWidth, int &srcHeight, int &dstWidth, int &dstHeight, int bpp);
 	VirtualFramebuffer *FindDownloadTempBuffer(VirtualFramebuffer *vfb);
 	virtual bool CreateDownloadTempBuffer(VirtualFramebuffer *nvfb) = 0;
 	virtual void UpdateDownloadTempBuffer(VirtualFramebuffer *nvfb) = 0;
+
+	VirtualFramebuffer *CreateRAMFramebuffer(uint32_t fbAddress, int width, int height, int stride, GEBufferFormat format);
 	void OptimizeDownloadRange(VirtualFramebuffer *vfb, int &x, int &y, int &w, int &h);
 
 	void UpdateFramebufUsage(VirtualFramebuffer *vfb);
@@ -393,7 +390,6 @@ protected:
 
 	std::vector<VirtualFramebuffer *> vfbs_;
 	std::vector<VirtualFramebuffer *> bvfbs_; // blitting framebuffers (for download)
-	std::set<std::pair<u32, u32>> knownFramebufferRAMCopies_;
 
 	bool gameUsesSequentialCopies_ = false;
 
@@ -403,7 +399,6 @@ protected:
 	int pixelWidth_;
 	int pixelHeight_;
 	int bloomHack_ = 0;
-	bool trueColor_ = false;
 
 	// Used by post-processing shaders
 	std::vector<Draw::Framebuffer *> extraFBOs_;

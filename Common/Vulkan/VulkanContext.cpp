@@ -60,7 +60,7 @@ static const char *validationLayers[] = {
 std::string VulkanVendorString(uint32_t vendorId) {
 	switch (vendorId) {
 	case VULKAN_VENDOR_INTEL: return "Intel";
-	case VULKAN_VENDOR_NVIDIA: return "nVidia";
+	case VULKAN_VENDOR_NVIDIA: return "NVIDIA";
 	case VULKAN_VENDOR_AMD: return "AMD";
 	case VULKAN_VENDOR_ARM: return "ARM";
 	case VULKAN_VENDOR_QUALCOMM: return "Qualcomm";
@@ -77,24 +77,14 @@ const char *PresentModeString(VkPresentModeKHR presentMode) {
 	case VK_PRESENT_MODE_MAILBOX_KHR: return "MAILBOX";
 	case VK_PRESENT_MODE_FIFO_KHR: return "FIFO";
 	case VK_PRESENT_MODE_FIFO_RELAXED_KHR: return "FIFO_RELAXED";
+	case VK_PRESENT_MODE_SHARED_DEMAND_REFRESH_KHR: return "SHARED_DEMAND_REFRESH_KHR";
+	case VK_PRESENT_MODE_SHARED_CONTINUOUS_REFRESH_KHR: return "SHARED_CONTINUOUS_REFRESH_KHR";
 	default: return "UNKNOWN";
 	}
 }
 
 VulkanContext::VulkanContext() {
-#if SIMULATE_VULKAN_FAILURE == 1
-	return;
-#endif
-	if (!VulkanLoad()) {
-		init_error_ = "Failed to load Vulkan driver library";
-		// No DLL?
-		return;
-	}
-
-	// We can get the list of layers and extensions without an instance so we can use this information
-	// to enable the extensions we need that are available.
-	GetInstanceLayerProperties();
-	GetInstanceLayerExtensionList(nullptr, instance_extension_properties_);
+	// Do nothing here.
 }
 
 VkResult VulkanContext::CreateInstance(const CreateInfo &info) {
@@ -103,6 +93,16 @@ VkResult VulkanContext::CreateInstance(const CreateInfo &info) {
 		return VK_ERROR_INITIALIZATION_FAILED;
 	}
 
+	// We can get the list of layers and extensions without an instance so we can use this information
+	// to enable the extensions we need that are available.
+	GetInstanceLayerProperties();
+	GetInstanceLayerExtensionList(nullptr, instance_extension_properties_);
+
+	if (!IsInstanceExtensionAvailable(VK_KHR_SURFACE_EXTENSION_NAME)) {
+		// Cannot create a Vulkan display without VK_KHR_SURFACE_EXTENSION.
+		init_error_ = "Vulkan not loaded - no surface extension";
+		return VK_ERROR_INITIALIZATION_FAILED;
+	}
 	flags_ = info.flags;
 
 	// List extensions to try to enable.
@@ -120,9 +120,6 @@ VkResult VulkanContext::CreateInstance(const CreateInfo &info) {
 //#if defined(VK_USE_PLATFORM_XCB_KHR)
 //	instance_extensions_enabled_.push_back(VK_KHR_XCB_SURFACE_EXTENSION_NAME);
 //#endif
-//#if defined(VK_USE_PLATFORM_MIR_KHR)
-//	instance_extensions_enabled_.push_back(VK_KHR_MIR_SURFACE_EXTENSION_NAME);
-//#endif
 #if defined(VK_USE_PLATFORM_WAYLAND_KHR)
 	if (IsInstanceExtensionAvailable(VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME)) {
 		instance_extensions_enabled_.push_back(VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME);
@@ -131,16 +128,30 @@ VkResult VulkanContext::CreateInstance(const CreateInfo &info) {
 #endif
 
 	if (flags_ & VULKAN_FLAG_VALIDATE) {
-		if (IsInstanceExtensionAvailable(VK_EXT_DEBUG_REPORT_EXTENSION_NAME)) {
+		if (IsInstanceExtensionAvailable(VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) {
+			// Enable the validation layers
+			for (size_t i = 0; i < ARRAY_SIZE(validationLayers); i++) {
+				instance_layer_names_.push_back(validationLayers[i]);
+				device_layer_names_.push_back(validationLayers[i]);
+			}
+			instance_extensions_enabled_.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+			extensionsLookup_.EXT_debug_utils = true;
+		} else if (IsInstanceExtensionAvailable(VK_EXT_DEBUG_REPORT_EXTENSION_NAME)) {
 			for (size_t i = 0; i < ARRAY_SIZE(validationLayers); i++) {
 				instance_layer_names_.push_back(validationLayers[i]);
 				device_layer_names_.push_back(validationLayers[i]);
 			}
 			instance_extensions_enabled_.push_back(VK_EXT_DEBUG_REPORT_EXTENSION_NAME);
+			extensionsLookup_.EXT_debug_report = true;
 		} else {
 			ELOG("Validation layer extension not available - not enabling Vulkan validation.");
 			flags_ &= ~VULKAN_FLAG_VALIDATE;
 		}
+	}
+
+	if (IsInstanceExtensionAvailable(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME)) {
+		instance_extensions_enabled_.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
+		extensionsLookup_.KHR_get_physical_device_properties2 = true;
 	}
 
 	// Validate that all the instance extensions we ask for are actually available.
@@ -190,7 +201,7 @@ VkResult VulkanContext::CreateInstance(const CreateInfo &info) {
 		return res;
 	}
 
-	VulkanLoadInstanceFunctions(instance_);
+	VulkanLoadInstanceFunctions(instance_, extensionsLookup_);
 	if (!CheckLayers(instance_layer_properties_, instance_layer_names_)) {
 		WLOG("CheckLayers for instance failed");
 		// init_error_ = "Failed to validate instance layers";
@@ -222,8 +233,25 @@ VkResult VulkanContext::CreateInstance(const CreateInfo &info) {
 		return res;
 	}
 
-	for (uint32_t i = 0; i < gpu_count; i++) {
-		vkGetPhysicalDeviceProperties(physical_devices_[i], &physicalDeviceProperties_[i]);
+	if (extensionsLookup_.KHR_get_physical_device_properties2) {
+		for (uint32_t i = 0; i < gpu_count; i++) {
+			VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+			VkPhysicalDevicePushDescriptorPropertiesKHR pushProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR};
+			VkPhysicalDeviceExternalMemoryHostPropertiesEXT extHostMemProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
+			props2.pNext = &pushProps;
+			pushProps.pNext = &extHostMemProps;
+			vkGetPhysicalDeviceProperties2KHR(physical_devices_[i], &props2);
+			// Don't want bad pointers sitting around.
+			props2.pNext = nullptr;
+			pushProps.pNext = nullptr;
+			physicalDeviceProperties_[i].properties = props2.properties;
+			physicalDeviceProperties_[i].pushDescriptorProperties = pushProps;
+			physicalDeviceProperties_[i].externalMemoryHostProperties = extHostMemProps;
+		}
+	} else {
+		for (uint32_t i = 0; i < gpu_count; i++) {
+			vkGetPhysicalDeviceProperties(physical_devices_[i], &physicalDeviceProperties_[i].properties);
+		}
 	}
 	return VK_SUCCESS;
 }
@@ -423,7 +451,7 @@ bool VulkanContext::CheckLayers(const std::vector<LayerProperties> &layer_props,
 
 int VulkanContext::GetPhysicalDeviceByName(std::string name) {
 	for (size_t i = 0; i < physical_devices_.size(); i++) {
-		if (physicalDeviceProperties_[i].deviceName == name)
+		if (physicalDeviceProperties_[i].properties.deviceName == name)
 			return (int)i;
 	}
 	return -1;
@@ -481,8 +509,8 @@ void VulkanContext::ChooseDevice(int physical_device) {
 	vkGetPhysicalDeviceQueueFamilyProperties(physical_devices_[physical_device_], &queue_count, nullptr);
 	assert(queue_count >= 1);
 
-	queue_props.resize(queue_count);
-	vkGetPhysicalDeviceQueueFamilyProperties(physical_devices_[physical_device_], &queue_count, queue_props.data());
+	queueFamilyProperties_.resize(queue_count);
+	vkGetPhysicalDeviceQueueFamilyProperties(physical_devices_[physical_device_], &queue_count, queueFamilyProperties_.data());
 	assert(queue_count >= 1);
 
 	// Detect preferred formats, in this order.
@@ -505,41 +533,56 @@ void VulkanContext::ChooseDevice(int physical_device) {
 		ELOG("Could not find a usable depth stencil format.");
 	}
 
-	// This is as good a place as any to do this
+	// This is as good a place as any to do this.
 	vkGetPhysicalDeviceMemoryProperties(physical_devices_[physical_device_], &memory_properties);
+	ILOG("Memory Types (%d):", memory_properties.memoryTypeCount);
+	for (int i = 0; i < (int)memory_properties.memoryTypeCount; i++) {
+		// Don't bother printing dummy memory types.
+		if (!memory_properties.memoryTypes[i].propertyFlags)
+			continue;
+		ILOG("  %d: Heap %d; Flags: %s%s%s%s  ", i, memory_properties.memoryTypes[i].heapIndex,
+			(memory_properties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ? "DEVICE_LOCAL " : "",
+			(memory_properties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ? "HOST_VISIBLE " : "",
+			(memory_properties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) ? "HOST_CACHED " : "",
+			(memory_properties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) ? "HOST_COHERENT " : "");
+	}
 
 	// Optional features
-	vkGetPhysicalDeviceFeatures(physical_devices_[physical_device_], &featuresAvailable_);
-	memset(&featuresEnabled_, 0, sizeof(featuresEnabled_));
+	if (extensionsLookup_.KHR_get_physical_device_properties2) {
+		VkPhysicalDeviceFeatures2 features2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2_KHR};
+		vkGetPhysicalDeviceFeatures2KHR(physical_devices_[physical_device_], &features2);
+		deviceFeatures_.available = features2.features;
+	} else {
+		vkGetPhysicalDeviceFeatures(physical_devices_[physical_device_], &deviceFeatures_.available);
+	}
+
+	deviceFeatures_.enabled = {};
 
 	// Enable a few safe ones if they are available.
-	if (featuresAvailable_.dualSrcBlend && physicalDeviceProperties_[physical_device_].vendorID != VULKAN_VENDOR_QUALCOMM) {
-		featuresEnabled_.dualSrcBlend = true;
+	if (deviceFeatures_.available.dualSrcBlend) {
+		deviceFeatures_.enabled.dualSrcBlend = true;
 	}
-	if (featuresAvailable_.largePoints) {
-		featuresEnabled_.largePoints = true;
+	if (deviceFeatures_.available.largePoints) {
+		deviceFeatures_.enabled.largePoints = true;
 	}
-	if (featuresAvailable_.wideLines) {
-		featuresEnabled_.wideLines = true;
+	if (deviceFeatures_.available.wideLines) {
+		deviceFeatures_.enabled.wideLines = true;
 	}
-	if (featuresAvailable_.geometryShader) {
-		featuresEnabled_.geometryShader = true;
+	if (deviceFeatures_.available.logicOp) {
+		deviceFeatures_.enabled.logicOp = true;
 	}
-	if (featuresAvailable_.logicOp) {
-		featuresEnabled_.logicOp = true;
+	if (deviceFeatures_.available.depthClamp) {
+		deviceFeatures_.enabled.depthClamp = true;
 	}
-	if (featuresAvailable_.depthClamp) {
-		featuresEnabled_.depthClamp = true;
+	if (deviceFeatures_.available.depthBounds) {
+		deviceFeatures_.enabled.depthBounds = true;
 	}
-	if (featuresAvailable_.depthBounds) {
-		featuresEnabled_.depthBounds = true;
-	}
-	if (featuresAvailable_.samplerAnisotropy) {
-		featuresEnabled_.samplerAnisotropy = true;
+	if (deviceFeatures_.available.samplerAnisotropy) {
+		deviceFeatures_.enabled.samplerAnisotropy = true;
 	}
 	// For easy wireframe mode, someday.
-	if (featuresEnabled_.fillModeNonSolid) {
-		featuresEnabled_.fillModeNonSolid = true;
+	if (deviceFeatures_.available.fillModeNonSolid) {
+		deviceFeatures_.enabled.fillModeNonSolid = true;
 	}
 
 	GetDeviceLayerExtensionList(nullptr, device_extension_properties_);
@@ -563,13 +606,13 @@ VkResult VulkanContext::CreateDevice() {
 		return VK_ERROR_INITIALIZATION_FAILED;
 	}
 
-	VkDeviceQueueCreateInfo queue_info{ VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
-	float queue_priorities[1] = { 1.0f };
+	VkDeviceQueueCreateInfo queue_info{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+	float queue_priorities[1] = {1.0f};
 	queue_info.queueCount = 1;
 	queue_info.pQueuePriorities = queue_priorities;
 	bool found = false;
 	for (int i = 0; i < (int)queue_count; i++) {
-		if (queue_props[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+		if (queueFamilyProperties_[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
 			queue_info.queueFamilyIndex = i;
 			found = true;
 			break;
@@ -577,7 +620,25 @@ VkResult VulkanContext::CreateDevice() {
 	}
 	assert(found);
 
-	deviceExtensionsLookup_.DEDICATED_ALLOCATION = EnableDeviceExtension(VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME);
+	extensionsLookup_.KHR_maintenance1 = EnableDeviceExtension(VK_KHR_MAINTENANCE1_EXTENSION_NAME);
+	extensionsLookup_.KHR_maintenance2 = EnableDeviceExtension(VK_KHR_MAINTENANCE2_EXTENSION_NAME);
+	extensionsLookup_.KHR_maintenance3 = EnableDeviceExtension(VK_KHR_MAINTENANCE3_EXTENSION_NAME);
+	extensionsLookup_.KHR_multiview = EnableDeviceExtension(VK_KHR_MULTIVIEW_EXTENSION_NAME);
+
+	if (EnableDeviceExtension(VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME)) {
+		extensionsLookup_.KHR_get_memory_requirements2 = true;
+		extensionsLookup_.KHR_dedicated_allocation = EnableDeviceExtension(VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME);
+	}
+	if (EnableDeviceExtension(VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME)) {
+		if (EnableDeviceExtension(VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME)) {
+			extensionsLookup_.EXT_external_memory_host = EnableDeviceExtension(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+		}
+	}
+	if (EnableDeviceExtension(VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME)) {
+		extensionsLookup_.KHR_create_renderpass2 = true;
+		extensionsLookup_.KHR_depth_stencil_resolve = EnableDeviceExtension(VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME);
+	}
+	extensionsLookup_.EXT_shader_stencil_export = EnableDeviceExtension(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
 
 	VkDeviceCreateInfo device_info{ VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
 	device_info.queueCreateInfoCount = 1;
@@ -586,13 +647,14 @@ VkResult VulkanContext::CreateDevice() {
 	device_info.ppEnabledLayerNames = device_info.enabledLayerCount ? device_layer_names_.data() : nullptr;
 	device_info.enabledExtensionCount = (uint32_t)device_extensions_enabled_.size();
 	device_info.ppEnabledExtensionNames = device_info.enabledExtensionCount ? device_extensions_enabled_.data() : nullptr;
-	device_info.pEnabledFeatures = &featuresEnabled_;
+	device_info.pEnabledFeatures = &deviceFeatures_.enabled;
+
 	VkResult res = vkCreateDevice(physical_devices_[physical_device_], &device_info, nullptr, &device_);
 	if (res != VK_SUCCESS) {
 		init_error_ = "Unable to create Vulkan device";
 		ELOG("Unable to create Vulkan device");
 	} else {
-		VulkanLoadDeviceFunctions(device_);
+		VulkanLoadDeviceFunctions(device_, extensionsLookup_);
 	}
 	ILOG("Device created.\n");
 	VulkanSetAvailable(true);
@@ -608,13 +670,11 @@ VkResult VulkanContext::InitDebugMsgCallback(PFN_vkDebugReportCallbackEXT dbgFun
 	}
 	ILOG("Registering debug report callback");
 
-	VkDebugReportCallbackCreateInfoEXT cb = {};
-	cb.sType = VK_STRUCTURE_TYPE_DEBUG_REPORT_CREATE_INFO_EXT;
-	cb.pNext = nullptr;
+	VkDebugReportCallbackCreateInfoEXT cb{VK_STRUCTURE_TYPE_DEBUG_REPORT_CREATE_INFO_EXT};
 	cb.flags = bits;
 	cb.pfnCallback = dbgFunc;
 	cb.pUserData = userdata;
-	VkResult res = dyn_vkCreateDebugReportCallbackEXT(instance_, &cb, nullptr, &msg_callback);
+	VkResult res = vkCreateDebugReportCallbackEXT(instance_, &cb, nullptr, &msg_callback);
 	switch (res) {
 	case VK_SUCCESS:
 		msg_callbacks.push_back(msg_callback);
@@ -628,49 +688,66 @@ VkResult VulkanContext::InitDebugMsgCallback(PFN_vkDebugReportCallbackEXT dbgFun
 }
 
 void VulkanContext::DestroyDebugMsgCallback() {
+	if (!extensionsLookup_.EXT_debug_report)
+		return;
 	while (msg_callbacks.size() > 0) {
-		dyn_vkDestroyDebugReportCallbackEXT(instance_, msg_callbacks.back(), nullptr);
+		vkDestroyDebugReportCallbackEXT(instance_, msg_callbacks.back(), nullptr);
 		msg_callbacks.pop_back();
 	}
 }
 
-void VulkanContext::InitSurface(WindowSystem winsys, void *data1, void *data2, int width, int height) {
+VkResult VulkanContext::InitDebugUtilsCallback(PFN_vkDebugUtilsMessengerCallbackEXT callback, int bits, void *userdata) {
+	VkDebugUtilsMessengerCreateInfoEXT callback1{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
+	callback1.messageSeverity = bits;
+	callback1.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+	callback1.pfnUserCallback = callback;
+	callback1.pUserData = userdata;
+	VkDebugUtilsMessengerEXT messenger;
+	VkResult res = vkCreateDebugUtilsMessengerEXT(instance_, &callback1, nullptr, &messenger);
+	if (res != VK_SUCCESS) {
+		ELOG("Failed to register debug callback with vkCreateDebugUtilsMessengerEXT");
+		// Do error handling for VK_ERROR_OUT_OF_MEMORY
+	} else {
+		ILOG("Debug callback registered with vkCreateDebugUtilsMessengerEXT.");
+		utils_callbacks.push_back(messenger);
+	}
+	return res;
+}
+
+void VulkanContext::DestroyDebugUtilsCallback() {
+	if (!extensionsLookup_.EXT_debug_utils)
+		return;
+	while (utils_callbacks.size() > 0) {
+		vkDestroyDebugUtilsMessengerEXT(instance_, utils_callbacks.back(), nullptr);
+		utils_callbacks.pop_back();
+	}
+}
+
+
+VkResult VulkanContext::InitSurface(WindowSystem winsys, void *data1, void *data2) {
 	winsys_ = winsys;
 	winsysData1_ = data1;
 	winsysData2_ = data2;
-	ReinitSurface(width, height);
+	return ReinitSurface();
 }
 
-void VulkanContext::ReinitSurface(int width, int height) {
+VkResult VulkanContext::ReinitSurface() {
 	if (surface_ != VK_NULL_HANDLE) {
-		ILOG("Destroying Vulkan surface (%d, %d)", width_, height_);
+		ILOG("Destroying Vulkan surface (%d, %d)", swapChainExtent_.width, swapChainExtent_.height);
 		vkDestroySurfaceKHR(instance_, surface_, nullptr);
 		surface_ = VK_NULL_HANDLE;
 	}
 
-	ILOG("Creating Vulkan surface (%d, %d)", width, height);
+	ILOG("Creating Vulkan surface for window");
 	switch (winsys_) {
 #ifdef _WIN32
 	case WINDOWSYSTEM_WIN32:
 	{
-		HINSTANCE connection = (HINSTANCE)winsysData1_;
-		HWND window = (HWND)winsysData2_;
-
-		if (width < 0 || height < 0)
-		{
-			RECT rc;
-			GetClientRect(window, &rc);
-			width = rc.right - rc.left;
-			height = rc.bottom - rc.top;
-		}
-
 		VkWin32SurfaceCreateInfoKHR win32{ VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR };
 		win32.flags = 0;
-		win32.hwnd = window;
-		win32.hinstance = connection;
-		VkResult res = vkCreateWin32SurfaceKHR(instance_, &win32, nullptr, &surface_);
-		assert(res == VK_SUCCESS);
-		break;
+		win32.hwnd = (HWND)winsysData2_;
+		win32.hinstance = (HINSTANCE)winsysData1_;
+		return vkCreateWin32SurfaceKHR(instance_, &win32, nullptr, &surface_);
 	}
 #endif
 #if defined(__ANDROID__)
@@ -680,54 +757,44 @@ void VulkanContext::ReinitSurface(int width, int height) {
 		VkAndroidSurfaceCreateInfoKHR android{ VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR };
 		android.flags = 0;
 		android.window = wnd;
-		VkResult res = vkCreateAndroidSurfaceKHR(instance_, &android, nullptr, &surface_);
-		assert(res == VK_SUCCESS);
-		break;
+		return vkCreateAndroidSurfaceKHR(instance_, &android, nullptr, &surface_);
 	}
 #endif
 #if defined(VK_USE_PLATFORM_XLIB_KHR)
 	case WINDOWSYSTEM_XLIB:
 	{
-		VkXlibSurfaceCreateInfoKHR xlib = { VK_STRUCTURE_TYPE_XLIB_SURFACE_CREATE_INFO_KHR };
+		VkXlibSurfaceCreateInfoKHR xlib{ VK_STRUCTURE_TYPE_XLIB_SURFACE_CREATE_INFO_KHR };
 		xlib.flags = 0;
 		xlib.dpy = (Display *)winsysData1_;
 		xlib.window = (Window)winsysData2_;
-		VkResult res = vkCreateXlibSurfaceKHR(instance_, &xlib, nullptr, &surface_);
-		assert(res == VK_SUCCESS);
-		break;
+		return vkCreateXlibSurfaceKHR(instance_, &xlib, nullptr, &surface_);
 	}
 #endif
 #if defined(VK_USE_PLATFORM_XCB_KHR)
 	case WINDOWSYSTEM_XCB:
 	{
-		VkXCBSurfaceCreateInfoKHR xcb = { VK_STRUCTURE_TYPE_XCB_SURFACE_CREATE_INFO_KHR };
+		VkXCBSurfaceCreateInfoKHR xcb{ VK_STRUCTURE_TYPE_XCB_SURFACE_CREATE_INFO_KHR };
 		xcb.flags = 0;
 		xcb.connection = (Connection *)winsysData1_;
 		xcb.window = (Window)(uintptr_t)winsysData2_;
-		VkResult res = vkCreateXcbSurfaceKHR(instance_, &xcb, nullptr, &surface_);
-		assert(res == VK_SUCCESS);
-		break;
+		return vkCreateXcbSurfaceKHR(instance_, &xcb, nullptr, &surface_);
 	}
 #endif
 #if defined(VK_USE_PLATFORM_WAYLAND_KHR)
 	case WINDOWSYSTEM_WAYLAND:
 	{
-		VkWaylandSurfaceCreateInfoKHR wayland = { VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR };
+		VkWaylandSurfaceCreateInfoKHR wayland{ VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR };
 		wayland.flags = 0;
 		wayland.display = (wl_display *)winsysData1_;
 		wayland.surface = (wl_surface *)winsysData2_;
-		VkResult res = vkCreateWaylandSurfaceKHR(instance_, &wayland, nullptr, &surface_);
-		assert(res == VK_SUCCESS);
-		break;
+		return vkCreateWaylandSurfaceKHR(instance_, &wayland, nullptr, &surface_);
 	}
 #endif
 
 	default:
 		_assert_msg_(G3D, false, "Vulkan support for chosen window system not implemented");
-		break;
+		return VK_ERROR_INITIALIZATION_FAILED;
 	}
-	width_ = width;
-	height_ = height;
 }
 
 bool VulkanContext::InitQueue() {
@@ -742,7 +809,7 @@ bool VulkanContext::InitQueue() {
 	uint32_t graphicsQueueNodeIndex = UINT32_MAX;
 	uint32_t presentQueueNodeIndex = UINT32_MAX;
 	for (uint32_t i = 0; i < queue_count; i++) {
-		if ((queue_props[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0) {
+		if ((queueFamilyProperties_[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0) {
 			if (graphicsQueueNodeIndex == UINT32_MAX) {
 				graphicsQueueNodeIndex = i;
 			}
@@ -777,7 +844,7 @@ bool VulkanContext::InitQueue() {
 	// Get the list of VkFormats that are supported:
 	uint32_t formatCount = 0;
 	VkResult res = vkGetPhysicalDeviceSurfaceFormatsKHR(physical_devices_[physical_device_], surface_, &formatCount, nullptr);
-	_assert_msg_(G3D, res == VK_SUCCESS, "Failed to get formats for device %p: %d surface: %p", physical_devices_[physical_device_], (int)res, surface_);
+	_assert_msg_(G3D, res == VK_SUCCESS, "Failed to get formats for device %d: %d", physical_device_, (int)res);
 	if (res != VK_SUCCESS) {
 		return false;
 	}
@@ -818,6 +885,28 @@ bool VulkanContext::InitQueue() {
 	return true;
 }
 
+int clamp(int x, int a, int b) {
+	if (x < a)
+		return a;
+	if (x > b)
+		return b;
+	return x;
+}
+
+static std::string surface_transforms_to_string(VkSurfaceTransformFlagsKHR transformFlags) {
+	std::string str;
+	if (transformFlags & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) str += "IDENTITY ";
+	if (transformFlags & VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR) str += "ROTATE_90 ";
+	if (transformFlags & VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR) str += "ROTATE_180 ";
+	if (transformFlags & VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR) str += "ROTATE_270 ";
+	if (transformFlags & VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_BIT_KHR) str += "HMIRROR ";
+	if (transformFlags & VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_90_BIT_KHR) str += "HMIRROR_90 ";
+	if (transformFlags & VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_180_BIT_KHR) str += "HMIRROR_180 ";
+	if (transformFlags & VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_270_BIT_KHR) str += "HMIRROR_270 ";
+	if (transformFlags & VK_SURFACE_TRANSFORM_INHERIT_BIT_KHR) str += "INHERIT ";
+	return str;
+}
+
 bool VulkanContext::InitSwapchain() {
 	VkResult res = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_devices_[physical_device_], surface_, &surfCapabilities_);
 	assert(res == VK_SUCCESS);
@@ -829,18 +918,14 @@ bool VulkanContext::InitSwapchain() {
 	res = vkGetPhysicalDeviceSurfacePresentModesKHR(physical_devices_[physical_device_], surface_, &presentModeCount, presentModes);
 	assert(res == VK_SUCCESS);
 
-	VkExtent2D swapChainExtent;
-	// width and height are either both -1, or both not -1.
-	if (surfCapabilities_.currentExtent.width == (uint32_t)-1) {
-		// If the surface size is undefined, the size is set to
-		// the size of the images requested.
-		ILOG("initSwapchain: %dx%d", width_, height_);
-		swapChainExtent.width = width_;
-		swapChainExtent.height = height_;
-	} else {
-		// If the surface size is defined, the swap chain size must match
-		swapChainExtent = surfCapabilities_.currentExtent;
-	}
+	ILOG("surfCapabilities_.currentExtent: %dx%d", surfCapabilities_.currentExtent.width, surfCapabilities_.currentExtent.height);
+	ILOG("surfCapabilities_.minImageExtent: %dx%d", surfCapabilities_.minImageExtent.width, surfCapabilities_.minImageExtent.height);
+	ILOG("surfCapabilities_.maxImageExtent: %dx%d", surfCapabilities_.maxImageExtent.width, surfCapabilities_.maxImageExtent.height);
+
+	swapChainExtent_.width = clamp(surfCapabilities_.currentExtent.width, surfCapabilities_.minImageExtent.width, surfCapabilities_.maxImageExtent.width);
+	swapChainExtent_.height = clamp(surfCapabilities_.currentExtent.height, surfCapabilities_.minImageExtent.height, surfCapabilities_.maxImageExtent.height);
+
+	ILOG("swapChainExtent: %dx%d", swapChainExtent_.width, swapChainExtent_.height);
 
 	// TODO: Find a better way to specify the prioritized present mode while being able
 	// to fall back in a sensible way.
@@ -883,29 +968,73 @@ bool VulkanContext::InitSwapchain() {
 		// Application must settle for fewer images than desired:
 		desiredNumberOfSwapChainImages = surfCapabilities_.maxImageCount;
 	}
-
+	
+	// We mostly follow the practices from
+	// https://arm-software.github.io/vulkan_best_practice_for_mobile_developers/samples/surface_rotation/surface_rotation_tutorial.html
+	// 
 	VkSurfaceTransformFlagBitsKHR preTransform;
-	if (surfCapabilities_.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) {
+	std::string supportedTransforms = surface_transforms_to_string(surfCapabilities_.supportedTransforms);
+	std::string currentTransform = surface_transforms_to_string(surfCapabilities_.currentTransform);
+	ILOG("Supported transforms: %s", supportedTransforms.c_str());
+	ILOG("Current transform: %s", currentTransform.c_str());
+	g_display_rotation = DisplayRotation::ROTATE_0;
+	g_display_rot_matrix.setIdentity();
+	bool swapChainExtentSwap = false;
+	if (surfCapabilities_.currentTransform & (VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR | VK_SURFACE_TRANSFORM_INHERIT_BIT_KHR)) {
 		preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
-	} else {
+	} else if (surfCapabilities_.currentTransform & (VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR | VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR | VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR)) {
+		// Normal, sensible rotations. Let's handle it.
 		preTransform = surfCapabilities_.currentTransform;
+		g_display_rot_matrix.setIdentity();
+		switch (surfCapabilities_.currentTransform) {
+		case VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR:
+			g_display_rotation = DisplayRotation::ROTATE_90;
+			g_display_rot_matrix.setRotationZ90();
+			std::swap(swapChainExtent_.width, swapChainExtent_.height);
+			break;
+		case VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR:
+			g_display_rotation = DisplayRotation::ROTATE_180;
+			g_display_rot_matrix.setRotationZ180();
+			break;
+		case VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR:
+			g_display_rotation = DisplayRotation::ROTATE_270;
+			g_display_rot_matrix.setRotationZ270();
+			std::swap(swapChainExtent_.width, swapChainExtent_.height);
+			break;
+		default:
+			assert(false);
+		}
+	} else {
+		// Let the OS rotate the image (potentially slow on many Android devices)
+		preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+	}
+	std::string preTransformStr = surface_transforms_to_string(preTransform);
+	ILOG("Chosen pretransform transform: %s", preTransformStr.c_str());
+
+	if (physicalDeviceProperties_[physical_device_].properties.vendorID == VULKAN_VENDOR_IMGTEC) {
+		ILOG("Applying PowerVR hack (rounding off the width!)");
+		// Swap chain width hack to avoid issue #11743 (PowerVR driver bug).
+		// To keep the size consistent even with pretransform, do this after the swap. Should be fine.
+		// This is fixed in newer PowerVR drivers but I don't know the cutoff.
+		swapChainExtent_.width &= ~31;
 	}
 
-	VkSwapchainCreateInfoKHR swap_chain_info = { VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR };
+	VkSwapchainCreateInfoKHR swap_chain_info{ VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR };
 	swap_chain_info.surface = surface_;
 	swap_chain_info.minImageCount = desiredNumberOfSwapChainImages;
 	swap_chain_info.imageFormat = swapchainFormat_;
-	swap_chain_info.imageColorSpace = VK_COLORSPACE_SRGB_NONLINEAR_KHR;
-	swap_chain_info.imageExtent.width = swapChainExtent.width;
-	swap_chain_info.imageExtent.height = swapChainExtent.height;
+	swap_chain_info.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+	swap_chain_info.imageExtent.width = swapChainExtent_.width;
+	swap_chain_info.imageExtent.height = swapChainExtent_.height;
 	swap_chain_info.preTransform = preTransform;
 	swap_chain_info.imageArrayLayers = 1;
 	swap_chain_info.presentMode = swapchainPresentMode;
 	swap_chain_info.oldSwapchain = VK_NULL_HANDLE;
 	swap_chain_info.clipped = true;
 	swap_chain_info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-	if (surfCapabilities_.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT)
-		swap_chain_info.imageUsage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+	// Don't ask for TRANSFER_DST for the swapchain image, we don't use that.
+	// if (surfCapabilities_.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT)
+	//	swap_chain_info.imageUsage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 
 #ifndef ANDROID
 	// We don't support screenshots on Android
@@ -930,7 +1059,7 @@ bool VulkanContext::InitSwapchain() {
 		ELOG("vkCreateSwapchainKHR failed!");
 		return false;
 	}
-
+	ILOG("Created swapchain: %dx%d", swap_chain_info.imageExtent.width, swap_chain_info.imageExtent.height);
 	return true;
 }
 
@@ -1240,4 +1369,65 @@ void VulkanDeleteList::PerformDeletes(VkDevice device) {
 		vkDestroyDescriptorSetLayout(device, descSetLayout, nullptr);
 	}
 	descSetLayouts_.clear();
+}
+
+void VulkanContext::GetImageMemoryRequirements(VkImage image, VkMemoryRequirements *mem_reqs, bool *dedicatedAllocation) {
+	if (DeviceExtensions().KHR_dedicated_allocation) {
+		VkImageMemoryRequirementsInfo2KHR memReqInfo2{VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2_KHR};
+		memReqInfo2.image = image;
+
+		VkMemoryRequirements2KHR memReq2 = {VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2_KHR};
+		VkMemoryDedicatedRequirementsKHR memDedicatedReq{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS_KHR};
+		memReq2.pNext = &memDedicatedReq;
+
+		vkGetImageMemoryRequirements2KHR(GetDevice(), &memReqInfo2, &memReq2);
+
+		*mem_reqs = memReq2.memoryRequirements;
+		*dedicatedAllocation =
+			(memDedicatedReq.requiresDedicatedAllocation != VK_FALSE) ||
+			(memDedicatedReq.prefersDedicatedAllocation != VK_FALSE);
+	} else {
+		vkGetImageMemoryRequirements(GetDevice(), image, mem_reqs);
+		*dedicatedAllocation = false;
+	}
+}
+
+bool IsHashMaliDriverVersion(const VkPhysicalDeviceProperties &props) {
+	// ARM used to put a hash in place of the driver version.
+	// Now they only use major versions. We'll just make a bad heuristic.
+	uint32_t major = VK_VERSION_MAJOR(props.driverVersion);
+	uint32_t minor = VK_VERSION_MINOR(props.driverVersion);
+	uint32_t branch = VK_VERSION_PATCH(props.driverVersion);
+	if (branch > 0)
+		return true;
+	if (branch > 100 || major > 100)
+		return true;
+	return false;
+}
+
+// From Sascha's code
+std::string FormatDriverVersion(const VkPhysicalDeviceProperties &props) {
+	if (props.vendorID == VULKAN_VENDOR_NVIDIA) {
+		// For whatever reason, NVIDIA has their own scheme.
+		// 10 bits = major version (up to r1023)
+		// 8 bits = minor version (up to 255)
+		// 8 bits = secondary branch version/build version (up to 255)
+		// 6 bits = tertiary branch/build version (up to 63)
+		uint32_t major = (props.driverVersion >> 22) & 0x3ff;
+		uint32_t minor = (props.driverVersion >> 14) & 0x0ff;
+		uint32_t secondaryBranch = (props.driverVersion >> 6) & 0x0ff;
+		uint32_t tertiaryBranch = (props.driverVersion) & 0x003f;
+		return StringFromFormat("%d.%d.%d.%d", major, minor, secondaryBranch, tertiaryBranch);
+	} else if (props.vendorID == VULKAN_VENDOR_ARM) {
+		// ARM used to just put a hash here. No point in splitting it up.
+		if (IsHashMaliDriverVersion(props)) {
+			return StringFromFormat("(hash) %08x", props.driverVersion);
+		}
+	}
+	// Qualcomm has an inscrutable versioning scheme. Let's just display it as normal.
+	// Standard scheme, use the standard macros.
+	uint32_t major = VK_VERSION_MAJOR(props.driverVersion);
+	uint32_t minor = VK_VERSION_MINOR(props.driverVersion);
+	uint32_t branch = VK_VERSION_PATCH(props.driverVersion);
+	return StringFromFormat("%d.%d.%d (%08x)", major, minor, branch, props.driverVersion);
 }

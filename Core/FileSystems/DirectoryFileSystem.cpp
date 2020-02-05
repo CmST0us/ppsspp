@@ -30,6 +30,7 @@
 #include "Core/HLE/sceKernel.h"
 #include "Core/HW/MemoryStick.h"
 #include "Core/CoreTiming.h"
+#include "Core/System.h"
 #include "Core/Host.h"
 #include "Core/Replay.h"
 #include "Core/Reporting.h"
@@ -66,9 +67,6 @@ static bool FixFilenameCase(const std::string &path, std::string &filename)
 	}
 
 	//TODO: lookup filename in cache for "path"
-
-	struct dirent_large { struct dirent entry; char padding[FILENAME_MAX+1]; } diren;
-	struct dirent_large;
 	struct dirent *result = NULL;
 
 	DIR *dirp = opendir(path.c_str());
@@ -77,7 +75,7 @@ static bool FixFilenameCase(const std::string &path, std::string &filename)
 
 	bool retValue = false;
 
-	while (!readdir_r(dirp, (dirent*) &diren, &result) && result)
+	while ((result = readdir(dirp)))
 	{
 		if (strlen(result->d_name) != filenameSize)
 			continue;
@@ -101,7 +99,7 @@ static bool FixFilenameCase(const std::string &path, std::string &filename)
 	return retValue;
 }
 
-bool FixPathCase(std::string& basePath, std::string &path, FixPathCaseBehavior behavior)
+bool FixPathCase(const std::string &basePath, std::string &path, FixPathCaseBehavior behavior)
 {
 	size_t len = path.size();
 
@@ -157,25 +155,29 @@ DirectoryFileSystem::DirectoryFileSystem(IHandleAllocator *_hAlloc, std::string 
 	hAlloc = _hAlloc;
 }
 
-std::string DirectoryFileHandle::GetLocalPath(std::string& basePath, std::string localpath)
+DirectoryFileSystem::~DirectoryFileSystem() {
+	CloseAll();
+}
+
+std::string DirectoryFileHandle::GetLocalPath(const std::string &basePath, std::string localpath)
 {
 	if (localpath.empty())
 		return basePath;
 
 	if (localpath[0] == '/')
-		localpath.erase(0,1);
-	//Convert slashes
+		localpath.erase(0, 1);
+
+	std::string result = basePath + localpath;
 #ifdef _WIN32
-	for (size_t i = 0; i < localpath.size(); i++) {
-		if (localpath[i] == '/')
-			localpath[i] = '\\';
+	for (char &c : result) {
+		if (c == '/')
+			c = '\\';
 	}
 #endif
-	return basePath + localpath;
+	return result;
 }
 
-bool DirectoryFileHandle::Open(std::string &basePath, std::string &fileName, FileAccess access, u32 &error)
-{
+bool DirectoryFileHandle::Open(const std::string &basePath, std::string &fileName, FileAccess access, u32 &error) {
 	error = 0;
 
 #if HOST_IS_CASE_SENSITIVE
@@ -189,7 +191,7 @@ bool DirectoryFileHandle::Open(std::string &basePath, std::string &fileName, Fil
 	// else we try fopen first (in case we're lucky) before simulating case insensitivity
 #endif
 
-	std::string fullName = GetLocalPath(basePath,fileName);
+	std::string fullName = GetLocalPath(basePath, fileName);
 	VERBOSE_LOG(FILESYS,"Actually opening %s", fullName.c_str());
 
 	// On the PSP, truncating doesn't lose data.  If you seek later, you'll recover it.
@@ -211,7 +213,7 @@ bool DirectoryFileHandle::Open(std::string &basePath, std::string &fileName, Fil
 	}
 	if (access & FILEACCESS_WRITE) {
 		desired   |= GENERIC_WRITE;
-		sharemode |= FILE_SHARE_WRITE;
+		sharemode |= FILE_SHARE_WRITE | FILE_SHARE_READ;
 	}
 	if (access & FILEACCESS_CREATE) {
 		if (access & FILEACCESS_EXCL) {
@@ -281,8 +283,10 @@ bool DirectoryFileHandle::Open(std::string &basePath, std::string &fileName, Fil
 
 #if HOST_IS_CASE_SENSITIVE
 	if (!success && !(access & FILEACCESS_CREATE)) {
-		if (!FixPathCase(basePath,fileName, FPC_PATH_MUST_EXIST) )
-			return 0;  // or go on and attempt (for a better error code than just 0?)
+		if (!FixPathCase(basePath, fileName, FPC_PATH_MUST_EXIST)) {
+			error = SCE_KERNEL_ERROR_ERRNO_FILE_NOT_FOUND;
+			return false;
+		}
 		fullName = GetLocalPath(basePath,fileName); 
 		const char *fullNameC = fullName.c_str();
 
@@ -319,6 +323,11 @@ bool DirectoryFileHandle::Open(std::string &basePath, std::string &fileName, Fil
 	}
 #endif
 
+	// Try to detect reads/writes to PSP/GAME to avoid them in replays.
+	if (fullName.find("/PSP/GAME/") != fullName.npos || fullName.find("\\PSP\\GAME\\") != fullName.npos) {
+		inGameDir_ = true;
+	}
+
 	return success;
 }
 
@@ -330,7 +339,7 @@ size_t DirectoryFileHandle::Read(u8* pointer, s64 size)
 		// On a PSP. it actually is truncated, but the data wasn't erased.
 		off_t off = (off_t)Seek(0, FILEMOVE_CURRENT);
 		if (needsTrunc_ <= off) {
-			return replay_ ? ReplayApplyDiskRead(pointer, 0, (uint32_t)size, CoreTiming::GetGlobalTimeUs()) : 0;
+			return replay_ ? ReplayApplyDiskRead(pointer, 0, (uint32_t)size, inGameDir_, CoreTiming::GetGlobalTimeUs()) : 0;
 		}
 		if (needsTrunc_ < off + size) {
 			size = needsTrunc_ - off;
@@ -341,7 +350,7 @@ size_t DirectoryFileHandle::Read(u8* pointer, s64 size)
 #else
 	bytesRead = read(hFile, pointer, size);
 #endif
-	return replay_ ? ReplayApplyDiskRead(pointer, (uint32_t)bytesRead, (uint32_t)size, CoreTiming::GetGlobalTimeUs()) : bytesRead;
+	return replay_ ? ReplayApplyDiskRead(pointer, (uint32_t)bytesRead, (uint32_t)size, inGameDir_, CoreTiming::GetGlobalTimeUs()) : bytesRead;
 }
 
 size_t DirectoryFileHandle::Write(const u8* pointer, s64 size)
@@ -366,6 +375,10 @@ size_t DirectoryFileHandle::Write(const u8* pointer, s64 size)
 		if (needsTrunc_ < off) {
 			needsTrunc_ = off;
 		}
+	}
+
+	if (replay_) {
+		bytesWritten = ReplayApplyDiskWrite(pointer, (uint64_t)bytesWritten, (uint64_t)size, &diskFull, inGameDir_, CoreTiming::GetGlobalTimeUs());
 	}
 
 	if (diskFull) {
@@ -446,14 +459,10 @@ void DirectoryFileHandle::Close()
 
 void DirectoryFileSystem::CloseAll() {
 	for (auto iter = entries.begin(); iter != entries.end(); ++iter) {
+		INFO_LOG(FILESYS, "DirectoryFileSystem::CloseAll(): Force closing %d (%s)", (int)iter->first, iter->second.guestFilename.c_str());
 		iter->second.hFile.Close();
 	}
-
 	entries.clear();
-}
-
-DirectoryFileSystem::~DirectoryFileSystem() {
-	CloseAll();
 }
 
 std::string DirectoryFileSystem::GetLocalPath(std::string localpath) {
@@ -840,6 +849,7 @@ std::vector<PSPFileInfo> DirectoryFileSystem::GetDirListing(std::string path) {
 		return ReplayApplyDiskListing(myVector, CoreTiming::GetGlobalTimeUs());
 	}
 
+	bool hideISOFiles = PSP_CoreParameter().compat.flags().HideISOFiles;
 	while (true) {
 		PSPFileInfo entry;
 		if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
@@ -856,10 +866,16 @@ std::vector<PSPFileInfo> DirectoryFileSystem::GetDirListing(std::string path) {
 		else
 			entry.size = findData.nFileSizeLow | ((u64)findData.nFileSizeHigh<<32);
 		entry.name = SimulateVFATBug(ConvertWStringToUTF8(findData.cFileName));
+
+		bool hideFile = false;
+		if (hideISOFiles && (endsWithNoCase(entry.name, ".cso") || endsWithNoCase(entry.name, ".iso"))) {
+			// Workaround for DJ Max Portable, see compat.ini.
+			hideFile = true;
+		}
 		tmFromFiletime(entry.atime, findData.ftLastAccessTime);
 		tmFromFiletime(entry.ctime, findData.ftCreationTime);
 		tmFromFiletime(entry.mtime, findData.ftLastWriteTime);
-		if (!listingRoot || (wcscmp(findData.cFileName, L"..") && wcscmp(findData.cFileName, L".")))
+		if (!hideFile && (!listingRoot || (wcscmp(findData.cFileName, L"..") && wcscmp(findData.cFileName, L"."))))
 			myVector.push_back(entry);
 
 		int retval = FindNextFile(hFind, &findData);
@@ -885,6 +901,7 @@ std::vector<PSPFileInfo> DirectoryFileSystem::GetDirListing(std::string path) {
 		return ReplayApplyDiskListing(myVector, CoreTiming::GetGlobalTimeUs());
 	}
 
+	bool hideISOFiles = PSP_CoreParameter().compat.flags().HideISOFiles;
 	while ((dirp = readdir(dp)) != NULL) {
 		PSPFileInfo entry;
 		struct stat s;
@@ -897,10 +914,17 @@ std::vector<PSPFileInfo> DirectoryFileSystem::GetDirListing(std::string path) {
 		entry.access = s.st_mode & 0x1FF;
 		entry.name = SimulateVFATBug(dirp->d_name);
 		entry.size = s.st_size;
+
+		bool hideFile = false;
+		if (hideISOFiles && (endsWithNoCase(entry.name, ".cso") || endsWithNoCase(entry.name, ".iso"))) {
+			// Workaround for DJ Max Portable, see compat.ini.
+			hideFile = true;
+		}
+
 		localtime_r((time_t*)&s.st_atime,&entry.atime);
 		localtime_r((time_t*)&s.st_ctime,&entry.ctime);
 		localtime_r((time_t*)&s.st_mtime,&entry.mtime);
-		if (!listingRoot || (strcmp(dirp->d_name, "..") && strcmp(dirp->d_name, ".")))
+		if (!hideFile && (!listingRoot || (strcmp(dirp->d_name, "..") && strcmp(dirp->d_name, "."))))
 			myVector.push_back(entry);
 	}
 	closedir(dp);

@@ -22,6 +22,7 @@
 #include "base/colorutil.h"
 #include "base/timeutil.h"
 #include "math/curves.h"
+#include "net/resolve.h"
 #include "gfx_es2/gpu_features.h"
 #include "gfx_es2/draw_buffer.h"
 #include "i18n/i18n.h"
@@ -44,6 +45,7 @@
 #include "UI/TiltAnalogSettingsScreen.h"
 #include "UI/TiltEventProcessor.h"
 #include "UI/ComboKeyMappingScreen.h"
+#include "UI/GPUDriverTestScreen.h"
 
 #include "Common/KeyMap.h"
 #include "Common/FileUtil.h"
@@ -67,8 +69,6 @@
 #include "Windows/W32Util/ShellUtil.h"
 #endif
 
-extern bool VulkanMayBeAvailable();
-
 GameSettingsScreen::GameSettingsScreen(std::string gamePath, std::string gameID, bool editThenRestore)
 	: UIDialogScreenWithGameBackground(gamePath), gameID_(gameID), enableReports_(false), editThenRestore_(editThenRestore) {
 	lastVertical_ = UseVerticalLayout();
@@ -80,7 +80,7 @@ bool GameSettingsScreen::UseVerticalLayout() const {
 
 // This needs before run CheckGPUFeatures()
 // TODO: Remove this if fix the issue
-bool CheckSupportInstancedTessellationGLES() {
+bool CheckSupportShaderTessellationGLES() {
 #if PPSSPP_PLATFORM(UWP)
 	return true;
 #else
@@ -88,21 +88,17 @@ bool CheckSupportInstancedTessellationGLES() {
 	int maxVertexTextureImageUnits = gl_extensions.maxVertexTextureUnits;
 	bool vertexTexture = maxVertexTextureImageUnits >= 3; // At least 3 for hardware tessellation
 
-	bool canUseInstanceID = gl_extensions.EXT_draw_instanced || gl_extensions.ARB_draw_instanced;
-	bool canDefInstanceID = gl_extensions.IsGLES || gl_extensions.EXT_gpu_shader4 || gl_extensions.VersionGEThan(3, 1);
-	bool instanceRendering = gl_extensions.GLES3 || (canUseInstanceID && canDefInstanceID);
-
 	bool textureFloat = gl_extensions.ARB_texture_float || gl_extensions.OES_texture_float;
 	bool hasTexelFetch = gl_extensions.GLES3 || (!gl_extensions.IsGLES && gl_extensions.VersionGEThan(3, 3, 0)) || gl_extensions.EXT_gpu_shader4;
 
-	return instanceRendering && vertexTexture && textureFloat && hasTexelFetch;
+	return vertexTexture && textureFloat && hasTexelFetch;
 #endif
 }
 
 bool DoesBackendSupportHWTess() {
 	switch (GetGPUBackend()) {
 	case GPUBackend::OPENGL:
-		return CheckSupportInstancedTessellationGLES();
+		return CheckSupportShaderTessellationGLES();
 	case GPUBackend::VULKAN:
 	case GPUBackend::DIRECT3D11:
 		return true;
@@ -137,10 +133,9 @@ void GameSettingsScreen::CreateViews() {
 	ReloadAllPostShaderInfo();
 
 	if (editThenRestore_) {
-		g_Config.loadGameConfig(gameID_);
+		std::shared_ptr<GameInfo> info = g_gameInfoCache->GetInfo(nullptr, gamePath_, 0);
+		g_Config.loadGameConfig(gameID_, info->GetTitle());
 	}
-
-	cap60FPS_ = g_Config.iForceMaxEmulatedFPS == 60;
 
 	iAlternateSpeedPercent1_ = g_Config.iFpsLimit1 < 0 ? -1 : (g_Config.iFpsLimit1 * 100) / 60;
 	iAlternateSpeedPercent2_ = g_Config.iFpsLimit2 < 0 ? -1 : (g_Config.iFpsLimit2 * 100) / 60;
@@ -204,23 +199,17 @@ void GameSettingsScreen::CreateViews() {
 	static const char *renderingBackend[] = { "OpenGL", "Direct3D 9", "Direct3D 11", "Vulkan" };
 	PopupMultiChoice *renderingBackendChoice = graphicsSettings->Add(new PopupMultiChoice(&g_Config.iGPUBackend, gr->T("Backend"), renderingBackend, (int)GPUBackend::OPENGL, ARRAY_SIZE(renderingBackend), gr->GetName(), screenManager()));
 	renderingBackendChoice->OnChoice.Handle(this, &GameSettingsScreen::OnRenderingBackend);
-#if !PPSSPP_PLATFORM(WINDOWS)
-	renderingBackendChoice->HideChoice(1);  // D3D9
-	renderingBackendChoice->HideChoice(2);  // D3D11
-#else
-	if (!DoesVersionMatchWindows(6, 0, 0, 0, true)) {
-		// Hide the D3D11 choice if Windows version is older than Windows Vista.
-		renderingBackendChoice->HideChoice(2);  // D3D11
-	}
+
+	if (!g_Config.IsBackendEnabled(GPUBackend::OPENGL))
+		renderingBackendChoice->HideChoice((int)GPUBackend::OPENGL);
+	if (!g_Config.IsBackendEnabled(GPUBackend::DIRECT3D9))
+		renderingBackendChoice->HideChoice((int)GPUBackend::DIRECT3D9);
+	if (!g_Config.IsBackendEnabled(GPUBackend::DIRECT3D11))
+		renderingBackendChoice->HideChoice((int)GPUBackend::DIRECT3D11);
+	if (!g_Config.IsBackendEnabled(GPUBackend::VULKAN))
+		renderingBackendChoice->HideChoice((int)GPUBackend::VULKAN);
 #endif
-	bool vulkanAvailable = false;
-#ifndef IOS
-	vulkanAvailable = VulkanMayBeAvailable();
-#endif
-	if (!vulkanAvailable) {
-		renderingBackendChoice->HideChoice(3);
-	}
-#endif
+
 	Draw::DrawContext *draw = screenManager()->getDrawContext();
 
 	// Backends that don't allow a device choice will only expose one device.
@@ -275,9 +264,10 @@ void GameSettingsScreen::CreateViews() {
 	graphicsSettings->Add(new ItemHeader(gr->T("Frame Rate Control")));
 	static const char *frameSkip[] = {"Off", "1", "2", "3", "4", "5", "6", "7", "8"};
 	graphicsSettings->Add(new PopupMultiChoice(&g_Config.iFrameSkip, gr->T("Frame Skipping"), frameSkip, 0, ARRAY_SIZE(frameSkip), gr->GetName(), screenManager()));
+	static const char *frameSkipType[] = {"Number of Frames", "Percent of FPS"};
+	graphicsSettings->Add(new PopupMultiChoice(&g_Config.iFrameSkipType, gr->T("Frame Skipping Type"), frameSkipType, 0, ARRAY_SIZE(frameSkipType), gr->GetName(), screenManager()));
 	frameSkipAuto_ = graphicsSettings->Add(new CheckBox(&g_Config.bAutoFrameSkip, gr->T("Auto FrameSkip")));
 	frameSkipAuto_->OnClick.Handle(this, &GameSettingsScreen::OnAutoFrameskip);
-	graphicsSettings->Add(new CheckBox(&cap60FPS_, gr->T("Force max 60 FPS (helps GoW)")));
 
 	PopupSliderChoice *altSpeed1 = graphicsSettings->Add(new PopupSliderChoice(&iAlternateSpeedPercent1_, 0, 1000, gr->T("Alternative Speed", "Alternative speed"), 5, screenManager(), gr->T("%, 0:unlimited")));
 	altSpeed1->SetFormat("%i%%");
@@ -300,7 +290,7 @@ void GameSettingsScreen::CreateViews() {
 	}
 
 #if !defined(MOBILE_DEVICE)
-	graphicsSettings->Add(new CheckBox(&g_Config.bFullScreen, gr->T("FullScreen")))->OnClick.Handle(this, &GameSettingsScreen::OnFullscreenChange);
+	graphicsSettings->Add(new CheckBox(&g_Config.bFullScreen, gr->T("FullScreen", "Full Screen")))->OnClick.Handle(this, &GameSettingsScreen::OnFullscreenChange);
 	if (System_GetPropertyInt(SYSPROP_DISPLAY_COUNT) > 1) {
 		CheckBox *fullscreenMulti = new CheckBox(&g_Config.bFullScreenMulti, gr->T("Use all displays"));
 		fullscreenMulti->SetEnabledPtr(&g_Config.bFullScreen);
@@ -314,7 +304,8 @@ void GameSettingsScreen::CreateViews() {
 #ifdef __ANDROID__
 	// Hide Immersive Mode on pre-kitkat Android
 	if (System_GetPropertyInt(SYSPROP_SYSTEMVERSION) >= 19) {
-		graphicsSettings->Add(new CheckBox(&g_Config.bImmersiveMode, gr->T("Immersive Mode")))->OnClick.Handle(this, &GameSettingsScreen::OnImmersiveModeChange);
+		// Let's reuse the Fullscreen translation string from desktop.
+		graphicsSettings->Add(new CheckBox(&g_Config.bImmersiveMode, gr->T("FullScreen", "Full Screen")))->OnClick.Handle(this, &GameSettingsScreen::OnImmersiveModeChange);
 	}
 #endif
 
@@ -392,11 +383,10 @@ void GameSettingsScreen::CreateViews() {
 		}
 		return UI::EVENT_CONTINUE;
 	});
-	beziersChoice->SetDisabledPtr(&g_Config.bHardwareTessellation);
 
 	CheckBox *tessellationHW = graphicsSettings->Add(new CheckBox(&g_Config.bHardwareTessellation, gr->T("Hardware Tessellation")));
 	tessellationHW->OnClick.Add([=](EventParams &e) {
-		settingInfo_->Show(gr->T("HardwareTessellation Tip", "Uses hardware to make curves, always uses a fixed quality"), e.v);
+		settingInfo_->Show(gr->T("HardwareTessellation Tip", "Uses hardware to make curves"), e.v);
 		return UI::EVENT_CONTINUE;
 	});
 	tessHWEnable_ = DoesBackendSupportHWTess() && !g_Config.bSoftwareRendering && g_Config.bHardwareTransform;
@@ -451,27 +441,7 @@ void GameSettingsScreen::CreateViews() {
 	static const char *bufFilters[] = { "Linear", "Nearest", };
 	graphicsSettings->Add(new PopupMultiChoice(&g_Config.iBufFilter, gr->T("Screen Scaling Filter"), bufFilters, 1, ARRAY_SIZE(bufFilters), gr->GetName(), screenManager()));
 
-#ifdef __ANDROID__
-	graphicsSettings->Add(new ItemHeader(gr->T("Cardboard Settings", "Cardboard Settings")));
-	CheckBox *cardboardMode = graphicsSettings->Add(new CheckBox(&g_Config.bEnableCardboard, gr->T("Enable Cardboard", "Enable Cardboard")));
-	cardboardMode->SetDisabledPtr(&g_Config.bSoftwareRendering);
-	PopupSliderChoice * cardboardScreenSize = graphicsSettings->Add(new PopupSliderChoice(&g_Config.iCardboardScreenSize, 30, 100, gr->T("Cardboard Screen Size", "Screen Size (in % of the viewport)"), 1, screenManager(), gr->T("% of viewport")));
-	cardboardScreenSize->SetDisabledPtr(&g_Config.bSoftwareRendering);
-	PopupSliderChoice *cardboardXShift = graphicsSettings->Add(new PopupSliderChoice(&g_Config.iCardboardXShift, -100, 100, gr->T("Cardboard Screen X Shift", "X Shift (in % of the void)"), 1, screenManager(), gr->T("% of the void")));
-	cardboardXShift->SetDisabledPtr(&g_Config.bSoftwareRendering);
-	PopupSliderChoice *cardboardYShift = graphicsSettings->Add(new PopupSliderChoice(&g_Config.iCardboardYShift, -100, 100, gr->T("Cardboard Screen Y Shift", "Y Shift (in % of the void)"), 1, screenManager(), gr->T("% of the void")));
-	cardboardYShift->SetDisabledPtr(&g_Config.bSoftwareRendering);
-#endif
-
 	graphicsSettings->Add(new ItemHeader(gr->T("Hack Settings", "Hack Settings (these WILL cause glitches)")));
-	CheckBox *timerHack = graphicsSettings->Add(new CheckBox(&g_Config.bTimerHack, gr->T("Timer Hack")));
-	timerHack->OnClick.Add([=](EventParams &e) {
-		settingInfo_->Show(gr->T("TimerHack Tip", "Changes game clock based on emu speed, may break games"), e.v);
-		return UI::EVENT_CONTINUE;
-	});
-
-	CheckBox *stencilTest = graphicsSettings->Add(new CheckBox(&g_Config.bDisableStencilTest, gr->T("Disable Stencil Test")));
-	stencilTest->SetDisabledPtr(&g_Config.bSoftwareRendering);
 
 	static const char *bloomHackOptions[] = { "Off", "Safe", "Balanced", "Aggressive" };
 	PopupMultiChoice *bloomHack = graphicsSettings->Add(new PopupMultiChoice(&g_Config.iBloomHack, gr->T("Lower resolution for effects (reduces artifacts)"), bloomHackOptions, 0, ARRAY_SIZE(bloomHackOptions), gr->GetName(), screenManager()));
@@ -506,6 +476,12 @@ void GameSettingsScreen::CreateViews() {
 
 	PopupSliderChoice *volume = audioSettings->Add(new PopupSliderChoice(&g_Config.iGlobalVolume, VOLUME_OFF, VOLUME_MAX, a->T("Global volume"), screenManager()));
 	volume->SetEnabledPtr(&g_Config.bEnableSound);
+	volume->SetZeroLabel(a->T("Mute"));
+
+	PopupSliderChoice *altVolume = audioSettings->Add(new PopupSliderChoice(&g_Config.iAltSpeedVolume, VOLUME_OFF, VOLUME_MAX, a->T("Alternate speed volume"), screenManager()));
+	altVolume->SetEnabledPtr(&g_Config.bEnableSound);
+	altVolume->SetZeroLabel(a->T("Mute"));
+	altVolume->SetNegativeDisable(a->T("Use global volume"));
 
 #ifdef _WIN32
 	if (IsVistaOrHigher()) {
@@ -526,9 +502,6 @@ void GameSettingsScreen::CreateViews() {
 		CheckBox *resampling = audioSettings->Add(new CheckBox(&g_Config.bAudioResampler, a->T("Audio sync", "Audio sync (resampling)")));
 		resampling->SetEnabledPtr(&g_Config.bEnableSound);
 	}
-
-	audioSettings->Add(new ItemHeader(a->T("Audio hacks")));
-	audioSettings->Add(new CheckBox(&g_Config.bSoundSpeedHack, a->T("Sound speed hack (DOA etc.)")));
 
 	// Control
 	ViewGroup *controlsSettingsScroll = new ScrollView(ORIENT_VERTICAL, new LinearLayoutParams(FILL_PARENT, FILL_PARENT));
@@ -653,13 +626,7 @@ void GameSettingsScreen::CreateViews() {
 	networkingSettings->Add(new CheckBox(&g_Config.bEnableWlan, n->T("Enable networking", "Enable networking/wlan (beta)")));
 	networkingSettings->Add(new CheckBox(&g_Config.bDiscordPresence, n->T("Send Discord Presence information")));
 
-#if !defined(MOBILE_DEVICE) && !defined(USING_QT_UI)
-	networkingSettings->Add(new PopupTextInputChoice(&g_Config.proAdhocServer, n->T("Change proAdhocServer Address"), "", 255, screenManager()));
-#elif defined(__ANDROID__)
 	networkingSettings->Add(new ChoiceWithValueDisplay(&g_Config.proAdhocServer, n->T("Change proAdhocServer Address"), (const char *)nullptr))->OnClick.Handle(this, &GameSettingsScreen::OnChangeproAdhocServerAddress);
-#else
-	networkingSettings->Add(new ChoiceWithValueDisplay(&g_Config.proAdhocServer, n->T("Change proAdhocServer Address"), (const char *)nullptr))->OnClick.Handle(this, &GameSettingsScreen::OnChangeproAdhocServerAddress);
-#endif
 	networkingSettings->Add(new CheckBox(&g_Config.bEnableAdhocServer, n->T("Enable built-in PRO Adhoc Server", "Enable built-in PRO Adhoc Server")));
 	networkingSettings->Add(new ChoiceWithValueDisplay(&g_Config.sMACAddress, n->T("Change Mac Address"), (const char *)nullptr))->OnClick.Handle(this, &GameSettingsScreen::OnChangeMacAddress);
 	networkingSettings->Add(new PopupSliderChoice(&g_Config.iPortOffset, 0, 60000, n->T("Port offset", "Port offset(0 = PSP compatibility)"), 100, screenManager()));
@@ -749,7 +716,11 @@ void GameSettingsScreen::CreateViews() {
 #if defined(USING_WIN_UI)
 	systemSettings->Add(new CheckBox(&g_Config.bBypassOSKWithKeyboard, sy->T("Enable Windows native keyboard", "Enable Windows native keyboard")));
 #endif
-#if defined(_WIN32) && !PPSSPP_PLATFORM(UWP)
+#if PPSSPP_PLATFORM(ANDROID)
+	auto memstickPath = systemSettings->Add(new ChoiceWithValueDisplay(&g_Config.memStickDirectory, sy->T("Change Memory Stick folder"), (const char *)nullptr));
+	memstickPath->SetEnabled(!PSP_IsInited());
+	memstickPath->OnClick.Handle(this, &GameSettingsScreen::OnChangeMemStickDir);
+#elif defined(_WIN32) && !PPSSPP_PLATFORM(UWP)
 	SavePathInMyDocumentChoice = systemSettings->Add(new CheckBox(&installed_, sy->T("Save path in My Documents", "Save path in My Documents")));
 	SavePathInMyDocumentChoice->OnClick.Handle(this, &GameSettingsScreen::OnSavePathMydoc);
 	SavePathInOtherChoice = systemSettings->Add(new CheckBox(&otherinstalled_, sy->T("Save path in installed.txt", "Save path in installed.txt")));
@@ -811,18 +782,18 @@ void GameSettingsScreen::CreateViews() {
 	systemSettings->Add(new PopupMultiChoice(&g_Config.iPSPModel, sy->T("PSP Model"), models, 0, ARRAY_SIZE(models), sy->GetName(), screenManager()))->SetEnabled(!PSP_IsInited());
 	// TODO: Come up with a way to display a keyboard for mobile users,
 	// so until then, this is Windows/Desktop only.
-#if !defined(MOBILE_DEVICE) && !defined(USING_QT_UI)  // TODO: Add all platforms where KEY_CHAR support is added
+#if !defined(MOBILE_DEVICE)  // TODO: Add all platforms where KEY_CHAR support is added
 	systemSettings->Add(new PopupTextInputChoice(&g_Config.sNickName, sy->T("Change Nickname"), "", 32, screenManager()));
-#elif defined(USING_QT_UI)
-	systemSettings->Add(new Choice(sy->T("Change Nickname")))->OnClick.Handle(this, &GameSettingsScreen::OnChangeNickname);
 #elif defined(__ANDROID__)
 	systemSettings->Add(new ChoiceWithValueDisplay(&g_Config.sNickName, sy->T("Change Nickname"), (const char *)nullptr))->OnClick.Handle(this, &GameSettingsScreen::OnChangeNickname);
 #endif
-#if defined(_WIN32) || (defined(USING_QT_UI) && !defined(MOBILE_DEVICE))
-	// Screenshot functionality is not yet available on non-Windows/non-Qt
+
 	systemSettings->Add(new CheckBox(&g_Config.bScreenshotsAsPNG, sy->T("Screenshots as PNG")));
+
+#if defined(_WIN32) || (defined(USING_QT_UI) && !defined(MOBILE_DEVICE))
 	systemSettings->Add(new CheckBox(&g_Config.bDumpFrames, sy->T("Record Display")));
 	systemSettings->Add(new CheckBox(&g_Config.bUseFFV1, sy->T("Use Lossless Video Codec (FFV1)")));
+	systemSettings->Add(new CheckBox(&g_Config.bDumpVideoOutput, sy->T("Use output buffer (with overlay) for recording")));
 	systemSettings->Add(new CheckBox(&g_Config.bDumpAudio, sy->T("Record Audio")));
 	systemSettings->Add(new CheckBox(&g_Config.bSaveLoadResetsAVdumping, sy->T("Reset Recording on Save/Load State")));
 #endif
@@ -868,7 +839,7 @@ UI::EventReturn GameSettingsScreen::OnScreenRotation(UI::EventParams &e) {
 	return UI::EVENT_DONE;
 }
 
-static void RecreateActivity() {
+void RecreateActivity() {
 	const int SYSTEM_JELLYBEAN = 16;
 	if (System_GetPropertyInt(SYSPROP_SYSTEMVERSION) >= SYSTEM_JELLYBEAN) {
 		ILOG("Sending recreate");
@@ -919,7 +890,15 @@ UI::EventReturn GameSettingsScreen::OnJitAffectingSetting(UI::EventParams &e) {
 	return UI::EVENT_DONE;
 }
 
-#if defined(_WIN32) && !PPSSPP_PLATFORM(UWP)
+#if PPSSPP_PLATFORM(ANDROID)
+
+UI::EventReturn GameSettingsScreen::OnChangeMemStickDir(UI::EventParams &e) {
+	I18NCategory *sy = GetI18NCategory("System");
+	System_SendMessage("inputbox", (std::string(sy->T("Memory Stick Folder")) + ":" + g_Config.memStickDirectory).c_str());
+	return UI::EVENT_DONE;
+}
+
+#elif defined(_WIN32) && !PPSSPP_PLATFORM(UWP)
 
 UI::EventReturn GameSettingsScreen::OnSavePathMydoc(UI::EventParams &e) {
 	const std::string PPSSPPpath = File::GetExeDirectory();
@@ -1048,7 +1027,6 @@ UI::EventReturn GameSettingsScreen::OnDumpNextFrameToLog(UI::EventParams &e) {
 
 void GameSettingsScreen::update() {
 	UIScreen::update();
-	g_Config.iForceMaxEmulatedFPS = cap60FPS_ ? 60 : 0;
 
 	g_Config.iFpsLimit1 = iAlternateSpeedPercent1_ < 0 ? -1 : (iAlternateSpeedPercent1_ * 60) / 100;
 	g_Config.iFpsLimit2 = iAlternateSpeedPercent2_ < 0 ? -1 : (iAlternateSpeedPercent2_ * 60) / 100;
@@ -1068,8 +1046,11 @@ void GameSettingsScreen::onFinish(DialogResult result) {
 
 	Reporting::Enable(enableReports_, "report.ppsspp.org");
 	Reporting::UpdateConfig();
-	g_Config.Save();
+	g_Config.Save("GameSettingsScreen::onFinish");
 	if (editThenRestore_) {
+		// In case we didn't have the title yet before, try again.
+		std::shared_ptr<GameInfo> info = g_gameInfoCache->GetInfo(nullptr, gamePath_, 0);
+		g_Config.changeGameSpecific(gameID_, info->GetTitle());
 		g_Config.unloadGameConfig();
 	}
 
@@ -1082,13 +1063,77 @@ void GameSettingsScreen::onFinish(DialogResult result) {
 	NativeMessageReceived("gpu_clearCache", "");
 }
 
+void GameSettingsScreen::sendMessage(const char *message, const char *value) {
+	UIDialogScreenWithGameBackground::sendMessage(message, value);
+
+	I18NCategory *sy = GetI18NCategory("System");
+	I18NCategory *di = GetI18NCategory("Dialog");
+
+	if (!strcmp(message, "inputbox_completed")) {
+		std::vector<std::string> inputboxValue;
+		SplitString(value, ':', inputboxValue);
+
+#if PPSSPP_PLATFORM(ANDROID)
+		if (inputboxValue.size() >= 2 && inputboxValue[0] == sy->T("Memory Stick Folder")) {
+			// Allow colons in the path.
+			std::string newPath = std::string(value).substr(inputboxValue[0].size() + 1);
+			size_t pos = newPath.find_last_not_of("/");
+			// Gotta have at least something but a /, and also needs to start with a /.
+			if (newPath.empty() || pos == newPath.npos || newPath[0] != '/') {
+				settingInfo_->Show(sy->T("ChangingMemstickPathInvalid", "That path couldn't be used to save Memory Stick files."), nullptr);
+				return;
+			}
+			if (pos != newPath.size() - 1) {
+				newPath = newPath.substr(0, pos + 1);
+			}
+
+			pendingMemstickFolder_ = newPath;
+			std::string promptMessage = sy->T("ChangingMemstickPath", "Save games, save states, and other data will not be copied to this folder.\n\nChange the Memory Stick folder?");
+			if (!File::Exists(newPath)) {
+				promptMessage = sy->T("ChangingMemstickPathNotExists", "That folder doesn't exist yet.\n\nSave games, save states, and other data will not be copied to this folder.\n\nCreate a new Memory Stick folder?");
+			}
+			// Add the path for clarity and proper confirmation.
+			promptMessage += "\n\n" + newPath + "/";
+			screenManager()->push(new PromptScreen(promptMessage, di->T("Yes"), di->T("No"), std::bind(&GameSettingsScreen::CallbackMemstickFolder, this, std::placeholders::_1)));
+		}
+#endif
+	}
+}
+
+#if PPSSPP_PLATFORM(ANDROID)
+void GameSettingsScreen::CallbackMemstickFolder(bool yes) {
+	I18NCategory *sy = GetI18NCategory("System");
+
+	if (yes) {
+		std::string memstickDirFile = g_Config.internalDataDirectory + "/memstick_dir.txt";
+		std::string testWriteFile = pendingMemstickFolder_ + "/.write_verify_file";
+
+		// Already, create away.
+		if (!File::Exists(pendingMemstickFolder_)) {
+			File::CreateFullPath(pendingMemstickFolder_);
+		}
+		if (!writeDataToFile(true, "1", 1, testWriteFile.c_str())) {
+			settingInfo_->Show(sy->T("ChangingMemstickPathInvalid", "That path couldn't be used to save Memory Stick files."), nullptr);
+			return;
+		}
+		File::Delete(testWriteFile);
+
+		writeDataToFile(true, pendingMemstickFolder_.c_str(), pendingMemstickFolder_.size(), memstickDirFile.c_str());
+		// Save so the settings, at least, are transferred.
+		g_Config.memStickDirectory = pendingMemstickFolder_ + "/";
+		g_Config.Save("MemstickPathChanged");
+		screenManager()->RecreateAllViews();
+	}
+}
+#endif
+
 void GameSettingsScreen::CallbackRenderingBackend(bool yes) {
 	// If the user ends up deciding not to restart, set the config back to the current backend
 	// so it doesn't get switched by accident.
 	if (yes) {
 		// Extra save here to make sure the choice really gets saved even if there are shutdown bugs in
 		// the GPU backend code.
-		g_Config.Save();
+		g_Config.Save("GameSettingsScreen::RenderingBackendYes");
 		System_SendMessage("graphics_restart", "");
 	} else {
 		g_Config.iGPUBackend = (int)GetGPUBackend();
@@ -1101,7 +1146,7 @@ void GameSettingsScreen::CallbackRenderingDevice(bool yes) {
 	if (yes) {
 		// Extra save here to make sure the choice really gets saved even if there are shutdown bugs in
 		// the GPU backend code.
-		g_Config.Save();
+		g_Config.Save("GameSettingsScreen::RenderingDeviceYes");
 		System_SendMessage("graphics_restart", "");
 	} else {
 		std::string *deviceNameSetting = GPUDeviceNameSetting();
@@ -1153,24 +1198,12 @@ UI::EventReturn GameSettingsScreen::OnChangeNickname(UI::EventParams &e) {
 }
 
 UI::EventReturn GameSettingsScreen::OnChangeproAdhocServerAddress(UI::EventParams &e) {
-#if PPSSPP_PLATFORM(WINDOWS) || defined(USING_QT_UI)
-	if (!g_Config.bFullScreen) {
-		const size_t name_len = 256;
+	I18NCategory *sy = GetI18NCategory("System");
 
-		char name[name_len];
-		memset(name, 0, sizeof(name));
-
-		if (System_InputBoxGetString("Enter an IP address", g_Config.proAdhocServer.c_str(), name, name_len)) {
-			std::string stripped = StripSpaces(name);
-			g_Config.proAdhocServer = stripped;
-		}
-	}
-	else
-		screenManager()->push(new ProAdhocServerScreen);
-#elif defined(__ANDROID__)
+#if defined(__ANDROID__)
 	System_SendMessage("inputbox", ("IP:" + g_Config.proAdhocServer).c_str());
 #else
-	screenManager()->push(new ProAdhocServerScreen);
+	screenManager()->push(new HostnameSelectScreen(&g_Config.proAdhocServer, sy->T("proAdhocServer Address:")));
 #endif
 
 	return UI::EVENT_DONE;
@@ -1222,8 +1255,8 @@ UI::EventReturn GameSettingsScreen::OnPostProcShaderChange(UI::EventParams &e) {
 }
 
 UI::EventReturn GameSettingsScreen::OnDeveloperTools(UI::EventParams &e) {
-	screenManager()->push(new DeveloperToolsScreen());
-	return UI::EVENT_DONE;
+screenManager()->push(new DeveloperToolsScreen());
+return UI::EVENT_DONE;
 }
 
 UI::EventReturn GameSettingsScreen::OnRemoteISO(UI::EventParams &e) {
@@ -1243,12 +1276,12 @@ UI::EventReturn GameSettingsScreen::OnTouchControlLayout(UI::EventParams &e) {
 
 //when the tilt event type is modified, we need to reset all tilt settings.
 //refer to the ResetTiltEvents() function for a detailed explanation.
-UI::EventReturn GameSettingsScreen::OnTiltTypeChange(UI::EventParams &e){
+UI::EventReturn GameSettingsScreen::OnTiltTypeChange(UI::EventParams &e) {
 	TiltEventProcessor::ResetTiltEvents();
 	return UI::EVENT_DONE;
 };
 
-UI::EventReturn GameSettingsScreen::OnTiltCustomize(UI::EventParams &e){
+UI::EventReturn GameSettingsScreen::OnTiltCustomize(UI::EventParams &e) {
 	screenManager()->push(new TiltAnalogSettingsScreen());
 	return UI::EVENT_DONE;
 };
@@ -1287,13 +1320,14 @@ void DeveloperToolsScreen::CreateViews() {
 	// iOS can now use JIT on all modes, apparently.
 	// The bool may come in handy for future non-jit platforms though (UWP XB1?)
 
-	static const char *cpuCores[] = { "Interpreter", "Dynarec (JIT)", "IR Interpreter" };
+	static const char *cpuCores[] = {"Interpreter", "Dynarec (JIT)", "IR Interpreter"};
 	PopupMultiChoice *core = list->Add(new PopupMultiChoice(&g_Config.iCpuCore, gr->T("CPU Core"), cpuCores, 0, ARRAY_SIZE(cpuCores), sy->GetName(), screenManager()));
 	core->OnChoice.Handle(this, &DeveloperToolsScreen::OnJitAffectingSetting);
 	if (!canUseJit) {
 		core->HideChoice(1);
 	}
 
+	list->Add(new Choice(dev->T("JIT debug tools")))->OnClick.Handle(this, &DeveloperToolsScreen::OnJitDebugTools);
 	list->Add(new CheckBox(&g_Config.bShowDeveloperMenu, dev->T("Show Developer Menu")));
 	list->Add(new CheckBox(&g_Config.bDumpDecryptedEboot, dev->T("Dump Decrypted Eboot", "Dump Decrypted EBOOT.BIN (If Encrypted) When Booting Game")));
 
@@ -1303,6 +1337,12 @@ void DeveloperToolsScreen::CreateViews() {
 
 	cpuTests->SetEnabled(TestsAvailable());
 #endif
+	// For now, we only implement GPU driver tests for Vulkan and OpenGL. This is simply
+	// because the D3D drivers are generally solid enough to not need this type of investigation.
+	if (g_Config.iGPUBackend == (int)GPUBackend::VULKAN || g_Config.iGPUBackend == (int)GPUBackend::OPENGL) {
+		list->Add(new Choice(dev->T("GPU Driver Test")))->OnClick.Handle(this, &DeveloperToolsScreen::OnGPUDriverTest);
+	}
+	list->Add(new Choice(dev->T("Touchscreen Test")))->OnClick.Handle(this, &DeveloperToolsScreen::OnTouchscreenTest);
 
 	allowDebugger_ = !WebServerStopped(WebServerFlags::DEBUGGER);
 	canAllowDebugger_ = !WebServerStopping(WebServerFlags::DEBUGGER);
@@ -1319,6 +1359,7 @@ void DeveloperToolsScreen::CreateViews() {
 	list->Add(new ItemHeader(dev->T("Texture Replacement")));
 	list->Add(new CheckBox(&g_Config.bSaveNewTextures, dev->T("Save new textures")));
 	list->Add(new CheckBox(&g_Config.bReplaceTextures, dev->T("Replace textures")));
+
 #if !defined(MOBILE_DEVICE)
 	Choice *createTextureIni = list->Add(new Choice(dev->T("Create/Open textures.ini file for current game")));
 	createTextureIni->OnClick.Handle(this, &DeveloperToolsScreen::OnOpenTexturesIniFile);
@@ -1329,7 +1370,7 @@ void DeveloperToolsScreen::CreateViews() {
 }
 
 void DeveloperToolsScreen::onFinish(DialogResult result) {
-	g_Config.Save();
+	g_Config.Save("DeveloperToolsScreen::onFinish");
 }
 
 void GameSettingsScreen::CallbackRestoreDefaults(bool yes) {
@@ -1393,6 +1434,21 @@ UI::EventReturn DeveloperToolsScreen::OnLogConfig(UI::EventParams &e) {
 	return UI::EVENT_DONE;
 }
 
+UI::EventReturn DeveloperToolsScreen::OnJitDebugTools(UI::EventParams &e) {
+	screenManager()->push(new JitDebugScreen());
+	return UI::EVENT_DONE;
+}
+
+UI::EventReturn DeveloperToolsScreen::OnGPUDriverTest(UI::EventParams &e) {
+	screenManager()->push(new GPUDriverTestScreen());
+	return UI::EVENT_DONE;
+}
+
+UI::EventReturn DeveloperToolsScreen::OnTouchscreenTest(UI::EventParams &e) {
+	screenManager()->push(new TouchTestScreen());
+	return UI::EVENT_DONE;
+}
+
 UI::EventReturn DeveloperToolsScreen::OnJitAffectingSetting(UI::EventParams &e) {
 	NativeMessageReceived("clear jit", "");
 	return UI::EVENT_DONE;
@@ -1415,130 +1471,156 @@ void DeveloperToolsScreen::update() {
 	canAllowDebugger_ = !WebServerStopping(WebServerFlags::DEBUGGER);
 }
 
-void ProAdhocServerScreen::CreateViews() {
+void HostnameSelectScreen::CreatePopupContents(UI::ViewGroup *parent) {
 	using namespace UI;
 	I18NCategory *sy = GetI18NCategory("System");
 	I18NCategory *di = GetI18NCategory("Dialog");
+	I18NCategory *n = GetI18NCategory("Networking");
 
-	tempProAdhocServer = g_Config.proAdhocServer;
-	root_ = new AnchorLayout(new LayoutParams(FILL_PARENT, FILL_PARENT));
-	LinearLayout *leftColumn = new LinearLayout(ORIENT_VERTICAL, new LinearLayoutParams(FILL_PARENT, FILL_PARENT));
+	LinearLayout *valueRow = new LinearLayout(ORIENT_VERTICAL, new LinearLayoutParams(FILL_PARENT, FILL_PARENT, Margins(0, 0, 0, 10)));
 
-	leftColumn->Add(new ItemHeader(sy->T("proAdhocServer Address:")));
-	addrView_ = new TextView(tempProAdhocServer, ALIGN_LEFT, false);
-	leftColumn->Add(addrView_);
-	LinearLayout *rightColumn = new LinearLayout(ORIENT_HORIZONTAL, new AnchorLayoutParams(0, 120, 10, NONE, NONE,10));
-	rightColumn->Add(new Button("0"))->OnClick.Handle(this, &ProAdhocServerScreen::On0Click);
-	rightColumn->Add(new Button("1"))->OnClick.Handle(this, &ProAdhocServerScreen::On1Click);
-	rightColumn->Add(new Button("2"))->OnClick.Handle(this, &ProAdhocServerScreen::On2Click);
-	rightColumn->Add(new Button("3"))->OnClick.Handle(this, &ProAdhocServerScreen::On3Click);
-	rightColumn->Add(new Button("4"))->OnClick.Handle(this, &ProAdhocServerScreen::On4Click);
-	rightColumn->Add(new Button("5"))->OnClick.Handle(this, &ProAdhocServerScreen::On5Click);
-	rightColumn->Add(new Button("6"))->OnClick.Handle(this, &ProAdhocServerScreen::On6Click);
-	rightColumn->Add(new Button("7"))->OnClick.Handle(this, &ProAdhocServerScreen::On7Click);
-	rightColumn->Add(new Button("8"))->OnClick.Handle(this, &ProAdhocServerScreen::On8Click);
-	rightColumn->Add(new Button("9"))->OnClick.Handle(this, &ProAdhocServerScreen::On9Click);
-	rightColumn->Add(new Button("."))->OnClick.Handle(this, &ProAdhocServerScreen::OnPointClick);
-	rightColumn->Add(new Button(di->T("Delete")))->OnClick.Handle(this, &ProAdhocServerScreen::OnDeleteClick);
-	rightColumn->Add(new Button(di->T("Delete all")))->OnClick.Handle(this, &ProAdhocServerScreen::OnDeleteAllClick);
-	rightColumn->Add(new Button(di->T("OK")))->OnClick.Handle(this, &ProAdhocServerScreen::OnOKClick);
-	rightColumn->Add(new Button(di->T("Cancel")))->OnClick.Handle(this, &ProAdhocServerScreen::OnCancelClick);
-	root_->Add(leftColumn);
-	root_->Add(rightColumn);
+	addrView_ = new TextEdit(*value_, "");
+	addrView_->SetTextAlign(FLAG_DYNAMIC_ASCII);
+	valueRow->Add(addrView_);
+	parent->Add(valueRow);
+
+	LinearLayout *buttonsRow1 = new LinearLayout(ORIENT_HORIZONTAL, new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT));
+	LinearLayout *buttonsRow2 = new LinearLayout(ORIENT_HORIZONTAL, new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT));
+	parent->Add(buttonsRow1);
+	parent->Add(buttonsRow2);
+
+	buttonsRow1->Add(new Spacer(new LinearLayoutParams(1.0, G_LEFT)));
+	for (char c = '0'; c <= '9'; ++c) {
+		char label[] = { c, '\0' };
+		auto button = buttonsRow1->Add(new Button(label));
+		button->OnClick.Handle(this, &HostnameSelectScreen::OnNumberClick);
+		button->SetTag(label);
+	}
+	buttonsRow1->Add(new Button("."))->OnClick.Handle(this, &HostnameSelectScreen::OnPointClick);
+	buttonsRow1->Add(new Spacer(new LinearLayoutParams(1.0, G_RIGHT)));
+
+	buttonsRow2->Add(new Spacer(new LinearLayoutParams(1.0, G_LEFT)));
+	buttonsRow2->Add(new Button(di->T("Delete")))->OnClick.Handle(this, &HostnameSelectScreen::OnDeleteClick);
+	buttonsRow2->Add(new Button(di->T("Delete all")))->OnClick.Handle(this, &HostnameSelectScreen::OnDeleteAllClick);
+	buttonsRow2->Add(new Spacer(new LinearLayoutParams(1.0, G_RIGHT)));
+
+	errorView_ = parent->Add(new TextView(n->T("Invalid IP or hostname"), ALIGN_HCENTER, false, new LinearLayoutParams(Margins(0, 10, 0, 0))));
+	errorView_->SetTextColor(0xFF3030FF);
+	errorView_->SetVisibility(V_GONE);
+
+	progressView_ = parent->Add(new TextView(n->T("Validating address..."), ALIGN_HCENTER, false, new LinearLayoutParams(Margins(0, 10, 0, 0))));
+	progressView_->SetVisibility(V_GONE);
 }
 
-UI::EventReturn ProAdhocServerScreen::On0Click(UI::EventParams &e) {
-	if (tempProAdhocServer.length() > 0)
-		tempProAdhocServer.append("0");
-	addrView_->SetText(tempProAdhocServer);
+void HostnameSelectScreen::SendEditKey(int keyCode, int flags) {
+	auto oldView = UI::GetFocusedView();
+	UI::SetFocusedView(addrView_);
+	KeyInput fakeKey{ DEVICE_ID_KEYBOARD, keyCode, KEY_DOWN | flags };
+	addrView_->Key(fakeKey);
+	UI::SetFocusedView(oldView);
+}
+
+UI::EventReturn HostnameSelectScreen::OnNumberClick(UI::EventParams &e) {
+	std::string text = e.v ? e.v->Tag() : "";
+	if (text.length() == 1 && text[0] >= '0' && text[0] <= '9') {
+		SendEditKey(text[0], KEY_CHAR);
+	}
 	return UI::EVENT_DONE;
 }
 
-UI::EventReturn ProAdhocServerScreen::On1Click(UI::EventParams &e) {
-	tempProAdhocServer.append("1");
-	addrView_->SetText(tempProAdhocServer);
+UI::EventReturn HostnameSelectScreen::OnPointClick(UI::EventParams &e) {
+	SendEditKey('.', KEY_CHAR);
 	return UI::EVENT_DONE;
 }
 
-UI::EventReturn ProAdhocServerScreen::On2Click(UI::EventParams &e) {
-	tempProAdhocServer.append("2");
-	addrView_->SetText(tempProAdhocServer);
+UI::EventReturn HostnameSelectScreen::OnDeleteClick(UI::EventParams &e) {
+	SendEditKey(NKCODE_DEL);
 	return UI::EVENT_DONE;
 }
 
-UI::EventReturn ProAdhocServerScreen::On3Click(UI::EventParams &e) {
-	tempProAdhocServer.append("3");
-	addrView_->SetText(tempProAdhocServer);
+UI::EventReturn HostnameSelectScreen::OnDeleteAllClick(UI::EventParams &e) {
+	addrView_->SetText("");
 	return UI::EVENT_DONE;
 }
 
-UI::EventReturn ProAdhocServerScreen::On4Click(UI::EventParams &e) {
-	tempProAdhocServer.append("4");
-	addrView_->SetText(tempProAdhocServer);
-	return UI::EVENT_DONE;
+void HostnameSelectScreen::ResolverThread() {
+	std::unique_lock<std::mutex> guard(resolverLock_);
+
+	while (resolverState_ != ResolverState::QUIT) {
+		resolverCond_.wait(guard);
+
+		if (resolverState_ == ResolverState::QUEUED) {
+			resolverState_ = ResolverState::PROGRESS;
+
+			addrinfo *resolved = nullptr;
+			std::string err;
+			toResolveResult_ = net::DNSResolve(toResolve_, "80", &resolved, err);
+			if (resolved)
+				net::DNSResolveFree(resolved);
+
+			resolverState_ = ResolverState::READY;
+		}
+	}
 }
 
-UI::EventReturn ProAdhocServerScreen::On5Click(UI::EventParams &e) {
-	tempProAdhocServer.append("5");
-	addrView_->SetText(tempProAdhocServer);
-	return UI::EVENT_DONE;
+bool HostnameSelectScreen::CanComplete(DialogResult result) {
+	if (result != DR_OK)
+		return true;
+
+	std::string value = addrView_->GetText();
+	if (lastResolved_ == value) {
+		return true;
+	}
+
+	// Currently running.
+	if (resolverState_ == ResolverState::PROGRESS)
+		return false;
+
+	std::lock_guard<std::mutex> guard(resolverLock_);
+	switch (resolverState_) {
+	case ResolverState::PROGRESS:
+	case ResolverState::QUIT:
+		return false;
+
+	case ResolverState::QUEUED:
+	case ResolverState::WAITING:
+		break;
+
+	case ResolverState::READY:
+		if (toResolve_ == value) {
+			// Reset the state, nothing there now.
+			resolverState_ = ResolverState::WAITING;
+			toResolve_.clear();
+			lastResolved_ = value;
+			lastResolvedResult_ = toResolveResult_;
+
+			if (lastResolvedResult_) {
+				errorView_->SetVisibility(UI::V_GONE);
+			} else {
+				errorView_->SetVisibility(UI::V_VISIBLE);
+			}
+			progressView_->SetVisibility(UI::V_GONE);
+
+			return true;
+		}
+
+		// Throw away that last result, it was for a different value.
+		break;
+	}
+
+	resolverState_ = ResolverState::QUEUED;
+	toResolve_ = value;
+	resolverCond_.notify_one();
+
+	progressView_->SetVisibility(UI::V_VISIBLE);
+	errorView_->SetVisibility(UI::V_GONE);
+
+	return false;
 }
 
-UI::EventReturn ProAdhocServerScreen::On6Click(UI::EventParams &e) {
-	tempProAdhocServer.append("6");
-	addrView_->SetText(tempProAdhocServer);
-	return UI::EVENT_DONE;
-}
-
-UI::EventReturn ProAdhocServerScreen::On7Click(UI::EventParams &e) {
-	tempProAdhocServer.append("7");
-	addrView_->SetText(tempProAdhocServer);
-	return UI::EVENT_DONE;
-}
-
-UI::EventReturn ProAdhocServerScreen::On8Click(UI::EventParams &e) {
-	tempProAdhocServer.append("8");
-	addrView_->SetText(tempProAdhocServer);
-	return UI::EVENT_DONE;
-}
-
-UI::EventReturn ProAdhocServerScreen::On9Click(UI::EventParams &e) {
-	tempProAdhocServer.append("9");
-	addrView_->SetText(tempProAdhocServer);
-	return UI::EVENT_DONE;
-}
-
-
-UI::EventReturn ProAdhocServerScreen::OnPointClick(UI::EventParams &e) {
-	if (tempProAdhocServer.length() > 0 && tempProAdhocServer.at(tempProAdhocServer.length() - 1) != '.')
-		tempProAdhocServer.append(".");
-	addrView_->SetText(tempProAdhocServer);
-	return UI::EVENT_DONE;
-}
-
-UI::EventReturn ProAdhocServerScreen::OnDeleteClick(UI::EventParams &e) {
-	if (tempProAdhocServer.length() > 0)
-		tempProAdhocServer.erase(tempProAdhocServer.length() -1, 1);
-	addrView_->SetText(tempProAdhocServer);
-	return UI::EVENT_DONE;
-}
-
-UI::EventReturn ProAdhocServerScreen::OnDeleteAllClick(UI::EventParams &e) {
-	tempProAdhocServer = "";
-	addrView_->SetText(tempProAdhocServer);
-	return UI::EVENT_DONE;
-}
-
-UI::EventReturn ProAdhocServerScreen::OnOKClick(UI::EventParams &e) {
-	g_Config.proAdhocServer = StripSpaces(tempProAdhocServer);
-	UIScreen::OnBack(e);
-	return UI::EVENT_DONE;
-}
-
-UI::EventReturn ProAdhocServerScreen::OnCancelClick(UI::EventParams &e) {
-	tempProAdhocServer = g_Config.proAdhocServer;
-	UIScreen::OnBack(e);
-	return UI::EVENT_DONE;
+void HostnameSelectScreen::OnCompleted(DialogResult result) {
+	if (result == DR_OK)
+		*value_ = addrView_->GetText();
 }
 
 SettingInfoMessage::SettingInfoMessage(int align, UI::AnchorLayoutParams *lp)
@@ -1547,7 +1629,6 @@ SettingInfoMessage::SettingInfoMessage(int align, UI::AnchorLayoutParams *lp)
 	SetSpacing(0.0f);
 	Add(new UI::Spacer(10.0f));
 	text_ = Add(new UI::TextView("", align, false, new LinearLayoutParams(1.0, Margins(0, 10))));
-	text_->SetTag("TEST?");
 	Add(new UI::Spacer(10.0f));
 }
 

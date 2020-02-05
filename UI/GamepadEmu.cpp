@@ -461,6 +461,9 @@ void InitPadLayout(float xres, float yres, float globalScale) {
 	float Action_button_spacing = g_Config.fActionButtonSpacing * baseActionButtonSpacing;
 	int Action_button_center_X = xres - Action_button_spacing * 2;
 	int Action_button_center_Y = yres - Action_button_spacing * 2;
+	if (g_Config.touchRightAnalogStick.show) {
+		Action_button_center_Y -= 150 * scale;
+	}
 	initTouchPos(g_Config.touchActionButtonCenter, Action_button_center_X, Action_button_center_Y);
 
 	//D-PAD (up down left right) (aka PSP cross)----------------------------
@@ -479,6 +482,12 @@ void InitPadLayout(float xres, float yres, float globalScale) {
 	int analog_stick_X = D_pad_X;
 	int analog_stick_Y = yres - 80 * scale;
 	initTouchPos(g_Config.touchAnalogStick, analog_stick_X, analog_stick_Y);
+
+	//right analog stick-------------------------------------------------
+	//keep the right analog stick right below the face buttons
+	int right_analog_stick_X = Action_button_center_X;
+	int right_analog_stick_Y = yres - 80 * scale;
+	initTouchPos(g_Config.touchRightAnalogStick, right_analog_stick_X, right_analog_stick_Y);
 
 	//select, start, throttle--------------------------------------------
 	//space between the bottom keys (space between select, start and un-throttle)
@@ -617,7 +626,7 @@ UI::ViewGroup *CreatePadLayout(float xres, float yres, bool *pause) {
 	if (unthrottle) {
 		unthrottle->SetAngle(180.0f);
 		unthrottle->OnChange.Add([](UI::EventParams &e) {
-			if (e.a) {
+			if (e.a && coreState == CORE_STEPPING) {
 				Core_EnableStepping(false);
 			}
 			return UI::EVENT_DONE;
@@ -641,6 +650,9 @@ UI::ViewGroup *CreatePadLayout(float xres, float yres, bool *pause) {
 
 	if (g_Config.touchAnalogStick.show)
 		root->Add(new PSPStick(stickBg, stickImage, I_STICK, 0, g_Config.touchAnalogStick.scale, buttonLayoutParams(g_Config.touchAnalogStick)));
+
+	if (g_Config.touchRightAnalogStick.show)
+		root->Add(new PSPStick(stickBg, stickImage, I_STICK, 1, g_Config.touchRightAnalogStick.scale, buttonLayoutParams(g_Config.touchRightAnalogStick)));
 
 	addComboKey(g_Config.iCombokey0, roundImage, I_ROUND, comboKeyImages[0], g_Config.touchCombo0);
 	addComboKey(g_Config.iCombokey1, roundImage, I_ROUND, comboKeyImages[1], g_Config.touchCombo1);

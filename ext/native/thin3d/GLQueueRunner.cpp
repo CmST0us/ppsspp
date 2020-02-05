@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "Common/MemoryUtil.h"
 #include "Core/Reporting.h"
 #include "GLQueueRunner.h"
@@ -66,8 +67,10 @@ void GLQueueRunner::DestroyDeviceObjects() {
 		glDeleteVertexArrays(1, &globalVAO_);
 	}
 	delete[] readbackBuffer_;
+	readbackBuffer_ = nullptr;
 	readbackBufferSize_ = 0;
 	delete[] tempBuffer_;
+	tempBuffer_ = nullptr;
 	tempBufferSize_ = 0;
 	CHECK_GL_ERROR_IF_DEBUG();
 }
@@ -104,7 +107,6 @@ void GLQueueRunner::RunInitSteps(const std::vector<GLRInitStep> &steps, bool ski
 			}
 			case GLRInitStepType::TEXTURE_IMAGE:
 			{
-				GLRTexture *tex = step.texture_image.texture;
 				if (step.texture_image.allocType == GLRAllocType::ALIGNED) {
 					FreeAlignedMemory(step.texture_image.data);
 				} else if (step.texture_image.allocType == GLRAllocType::NEW) {
@@ -171,8 +173,10 @@ void GLQueueRunner::RunInitSteps(const std::vector<GLRInitStep> &steps, bool ski
 			GLRProgram *program = step.create_program.program;
 			program->program = glCreateProgram();
 			_assert_msg_(G3D, step.create_program.num_shaders > 0, "Can't create a program with zero shaders");
+			bool anyFailed = false;
 			for (int j = 0; j < step.create_program.num_shaders; j++) {
 				_dbg_assert_msg_(G3D, step.create_program.shaders[j]->shader, "Can't create a program with a null shader");
+				anyFailed = anyFailed || step.create_program.shaders[j]->failed;
 				glAttachShader(program->program, step.create_program.shaders[j]->shader);
 			}
 
@@ -208,7 +212,8 @@ void GLQueueRunner::RunInitSteps(const std::vector<GLRInitStep> &steps, bool ski
 				std::string fsDesc = fs ? (fs->desc + (fs->failed ? " (failed)" : "")) : "(none)";
 				const char *vsCode = vs->code.c_str();
 				const char *fsCode = fs ? fs->code.c_str() : "(none)";
-				Reporting::ReportMessage("Error in shader program link: info: %s\nfs: %s\n%s\nvs: %s\n%s", infoLog.c_str(), fsDesc.c_str(), fsCode, vsDesc.c_str(), vsCode);
+				if (!anyFailed)
+					Reporting::ReportMessage("Error in shader program link: info: %s\nfs: %s\n%s\nvs: %s\n%s", infoLog.c_str(), fsDesc.c_str(), fsCode, vsDesc.c_str(), vsCode);
 
 				ELOG("Could not link program:\n %s", infoLog.c_str());
 				ERROR_LOG(G3D, "VS desc:\n%s", vsDesc.c_str());
@@ -244,6 +249,7 @@ void GLQueueRunner::RunInitSteps(const std::vector<GLRInitStep> &steps, bool ski
 					switch (init.type) {
 					case 0:
 						glUniform1i(uniform, init.value);
+						break;
 					}
 				}
 			}
@@ -306,14 +312,14 @@ void GLQueueRunner::RunInitSteps(const std::vector<GLRInitStep> &steps, bool ski
 				glBindTexture(tex->target, tex->texture);
 				boundTexture = tex->texture;
 			}
-			if (!step.texture_image.data)
+			if (!step.texture_image.data && step.texture_image.allocType != GLRAllocType::NONE)
 				Crash();
 			// For things to show in RenderDoc, need to split into glTexImage2D(..., nullptr) and glTexSubImage.
 			glTexImage2D(tex->target, step.texture_image.level, step.texture_image.internalFormat, step.texture_image.width, step.texture_image.height, 0, step.texture_image.format, step.texture_image.type, step.texture_image.data);
 			allocatedTextures = true;
 			if (step.texture_image.allocType == GLRAllocType::ALIGNED) {
 				FreeAlignedMemory(step.texture_image.data);
-			} else {
+			} else if (step.texture_image.allocType == GLRAllocType::NEW) {
 				delete[] step.texture_image.data;
 			}
 			CHECK_GL_ERROR_IF_DEBUG();
@@ -376,38 +382,76 @@ void GLQueueRunner::InitCreateFramebuffer(const GLRInitStep &step) {
 #ifndef USING_GLES2
 	if (!gl_extensions.ARB_framebuffer_object && gl_extensions.EXT_framebuffer_object) {
 		fbo_ext_create(step);
-	} else if (!gl_extensions.ARB_framebuffer_object) {
+	} else if (!gl_extensions.ARB_framebuffer_object && !gl_extensions.IsGLES) {
 		return;
 	}
 	// If GLES2, we have basic FBO support and can just proceed.
 #endif
 	CHECK_GL_ERROR_IF_DEBUG();
 
+	auto initFBOTexture = [&](GLRTexture &tex, GLint internalFormat, GLenum format, GLenum type, bool linear) {
+		glGenTextures(1, &tex.texture);
+		tex.target = GL_TEXTURE_2D;
+		tex.maxLod = 0.0f;
+
+		// Create the surfaces.
+		glBindTexture(GL_TEXTURE_2D, tex.texture);
+		glTexImage2D(GL_TEXTURE_2D, 0, internalFormat, fbo->width, fbo->height, 0, format, type, nullptr);
+
+		tex.wrapS = GL_CLAMP_TO_EDGE;
+		tex.wrapT = GL_CLAMP_TO_EDGE;
+		tex.magFilter = linear ? GL_LINEAR : GL_NEAREST;
+		tex.minFilter = linear ? GL_LINEAR : GL_NEAREST;
+		tex.canWrap = isPowerOf2(fbo->width) && isPowerOf2(fbo->height);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, tex.wrapS);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, tex.wrapT);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, tex.magFilter);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, tex.minFilter);
+		if (!gl_extensions.IsGLES || gl_extensions.GLES3) {
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+		}
+	};
+
 	// Color texture is same everywhere
 	glGenFramebuffers(1, &fbo->handle);
-	glGenTextures(1, &fbo->color_texture.texture);
-	fbo->color_texture.target = GL_TEXTURE_2D;
-	fbo->color_texture.maxLod = 0.0f;
+	initFBOTexture(fbo->color_texture, GL_RGBA, GL_RGBA, GL_UNSIGNED_BYTE, true);
 
-	// Create the surfaces.
-	glBindTexture(GL_TEXTURE_2D, fbo->color_texture.texture);
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, fbo->width, fbo->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+retry_depth:
+	if (!fbo->z_stencil_) {
+		ILOG("Creating %i x %i FBO using no depth", fbo->width, fbo->height);
 
-	fbo->color_texture.wrapS = GL_CLAMP_TO_EDGE;
-	fbo->color_texture.wrapT = GL_CLAMP_TO_EDGE;
-	fbo->color_texture.magFilter = GL_LINEAR;
-	fbo->color_texture.minFilter = GL_LINEAR;
-	fbo->color_texture.canWrap = isPowerOf2(fbo->width) && isPowerOf2(fbo->height);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, fbo->color_texture.wrapS);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, fbo->color_texture.wrapT);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, fbo->color_texture.magFilter);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, fbo->color_texture.minFilter);
-	if (!gl_extensions.IsGLES || gl_extensions.GLES3) {
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
-	}
+		fbo->z_stencil_buffer = 0;
+		fbo->stencil_buffer = 0;
+		fbo->z_buffer = 0;
 
-	if (gl_extensions.IsGLES) {
-		if (gl_extensions.OES_packed_depth_stencil) {
+		// Bind it all together
+		glBindFramebuffer(GL_FRAMEBUFFER, fbo->handle);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fbo->color_texture.texture, 0);
+		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, 0);
+		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, 0);
+	} else if (gl_extensions.IsGLES) {
+		if (gl_extensions.OES_packed_depth_stencil && (gl_extensions.OES_depth_texture || gl_extensions.GLES3)) {
+			ILOG("Creating %i x %i FBO using DEPTH24_STENCIL8 texture", fbo->width, fbo->height);
+			fbo->z_stencil_buffer = 0;
+			fbo->stencil_buffer = 0;
+			fbo->z_buffer = 0;
+
+			if (gl_extensions.GLES3) {
+				initFBOTexture(fbo->z_stencil_texture, GL_DEPTH24_STENCIL8, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, false);
+			} else {
+				initFBOTexture(fbo->z_stencil_texture, GL_DEPTH_STENCIL, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, false);
+			}
+
+			// Bind it all together
+			glBindFramebuffer(GL_FRAMEBUFFER, fbo->handle);
+			glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fbo->color_texture.texture, 0);
+			if (gl_extensions.GLES3) {
+				glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, fbo->z_stencil_texture.texture, 0);
+			} else {
+				glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, fbo->z_stencil_texture.texture, 0);
+				glFramebufferTexture2D(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_TEXTURE_2D, fbo->z_stencil_texture.texture, 0);
+			}
+		} else if (gl_extensions.OES_packed_depth_stencil) {
 			ILOG("Creating %i x %i FBO using DEPTH24_STENCIL8", fbo->width, fbo->height);
 			// Standard method
 			fbo->stencil_buffer = 0;
@@ -443,6 +487,18 @@ void GLQueueRunner::InitCreateFramebuffer(const GLRInitStep &step) {
 			glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, fbo->z_buffer);
 			glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, fbo->stencil_buffer);
 		}
+	} else if (gl_extensions.VersionGEThan(3, 0)) {
+		ILOG("Creating %i x %i FBO using DEPTH24_STENCIL8 texture", fbo->width, fbo->height);
+		fbo->z_stencil_buffer = 0;
+		fbo->stencil_buffer = 0;
+		fbo->z_buffer = 0;
+
+		initFBOTexture(fbo->z_stencil_texture, GL_DEPTH24_STENCIL8, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, false);
+
+		// Bind it all together
+		glBindFramebuffer(GL_FRAMEBUFFER, fbo->handle);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fbo->color_texture.texture, 0);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, fbo->z_stencil_texture.texture, 0);
 	} else {
 		fbo->stencil_buffer = 0;
 		fbo->z_buffer = 0;
@@ -459,6 +515,13 @@ void GLQueueRunner::InitCreateFramebuffer(const GLRInitStep &step) {
 	}
 
 	GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+	if (status != GL_FRAMEBUFFER_COMPLETE && !fbo->z_buffer) {
+		CHECK_GL_ERROR_IF_DEBUG();
+		// Uh oh, maybe we need a z/stencil.  Platforms sometimes, right?
+		fbo->z_stencil_ = true;
+		goto retry_depth;
+	}
+
 	switch (status) {
 	case GL_FRAMEBUFFER_COMPLETE:
 		// ILOG("Framebuffer verified complete.");
@@ -467,7 +530,7 @@ void GLQueueRunner::InitCreateFramebuffer(const GLRInitStep &step) {
 		ELOG("GL_FRAMEBUFFER_UNSUPPORTED");
 		break;
 	case GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT:
-		ELOG("GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT ");
+		ELOG("GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT");
 		break;
 	default:
 		FLOG("Other framebuffer error: %i", status);
@@ -490,7 +553,19 @@ void GLQueueRunner::RunSteps(const std::vector<GLRStep *> &steps, bool skipGLCal
 			const GLRStep &step = *steps[i];
 			switch (step.stepType) {
 			case GLRStepType::RENDER:
-				// TODO: With #11425 there'll be a case where we should really free spline data here.
+				for (const auto &c : step.commands) {
+					switch (c.cmd) {
+					case GLRRenderCommand::TEXTURE_SUBIMAGE:
+						if (c.texture_subimage.data) {
+							if (c.texture_subimage.allocType == GLRAllocType::ALIGNED) {
+								FreeAlignedMemory(c.texture_subimage.data);
+							} else if (c.texture_subimage.allocType == GLRAllocType::NEW) {
+								delete[] c.texture_subimage.data;
+							}
+						}
+						break;
+					}
+				}
 				break;
 			}
 			delete steps[i];
@@ -577,7 +652,9 @@ void GLQueueRunner::PerformRenderPass(const GLRStep &step) {
 	glDisable(GL_DITHER);
 	glEnable(GL_SCISSOR_TEST);
 #ifndef USING_GLES2
-	glDisable(GL_COLOR_LOGIC_OP);
+	if (!gl_extensions.IsGLES) {
+		glDisable(GL_COLOR_LOGIC_OP);
+	}
 #endif
 
 	/*
@@ -621,6 +698,7 @@ void GLQueueRunner::PerformRenderPass(const GLRStep &step) {
 
 	GLRTexture *curTex[8]{};
 
+	CHECK_GL_ERROR_IF_DEBUG();
 	auto &commands = step.commands;
 	for (const auto &c : commands) {
 		switch (c.cmd) {
@@ -720,7 +798,11 @@ void GLQueueRunner::PerformRenderPass(const GLRStep &step) {
 #if defined(USING_GLES2)
 				glClearDepthf(c.clear.clearZ);
 #else
-				glClearDepth(c.clear.clearZ);
+				if (gl_extensions.IsGLES) {
+					glClearDepthf(c.clear.clearZ);
+				} else {
+					glClearDepth(c.clear.clearZ);
+				}
 #endif
 			}
 			if (c.clear.clearMask & GL_STENCIL_BUFFER_BIT) {
@@ -758,7 +840,11 @@ void GLQueueRunner::PerformRenderPass(const GLRStep &step) {
 			// TODO: Support FP viewports through glViewportArrays
 			glViewport((GLint)c.viewport.vp.x, (GLint)y, (GLsizei)c.viewport.vp.w, (GLsizei)c.viewport.vp.h);
 #if !defined(USING_GLES2)
-			glDepthRange(c.viewport.vp.minZ, c.viewport.vp.maxZ);
+			if (gl_extensions.IsGLES) {
+				glDepthRangef(c.viewport.vp.minZ, c.viewport.vp.maxZ);
+			} else {
+				glDepthRange(c.viewport.vp.minZ, c.viewport.vp.maxZ);
+			}
 #else
 			glDepthRangef(c.viewport.vp.minZ, c.viewport.vp.maxZ);
 #endif
@@ -866,10 +952,14 @@ void GLQueueRunner::PerformRenderPass(const GLRStep &step) {
 			}
 			if (c.bind_fb_texture.aspect == GL_COLOR_BUFFER_BIT) {
 				if (curTex[slot] != &c.bind_fb_texture.framebuffer->color_texture)
-				glBindTexture(GL_TEXTURE_2D, c.bind_fb_texture.framebuffer->color_texture.texture);
+					glBindTexture(GL_TEXTURE_2D, c.bind_fb_texture.framebuffer->color_texture.texture);
 				curTex[slot] = &c.bind_fb_texture.framebuffer->color_texture;
+			} else if (c.bind_fb_texture.aspect == GL_DEPTH_BUFFER_BIT) {
+				if (curTex[slot] != &c.bind_fb_texture.framebuffer->z_stencil_texture)
+					glBindTexture(GL_TEXTURE_2D, c.bind_fb_texture.framebuffer->z_stencil_texture.texture);
+				curTex[slot] = &c.bind_fb_texture.framebuffer->z_stencil_texture;
 			} else {
-				// TODO: Depth texturing?
+				// TODO: Stencil texturing?
 				curTex[slot] = nullptr;
 			}
 			CHECK_GL_ERROR_IF_DEBUG();
@@ -998,7 +1088,7 @@ void GLQueueRunner::PerformRenderPass(const GLRStep &step) {
 				break;
 			}
 #ifndef USING_GLES2
-			if (tex->lodBias != c.textureLod.lodBias) {
+			if (tex->lodBias != c.textureLod.lodBias && !gl_extensions.IsGLES) {
 				glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_LOD_BIAS, c.textureLod.lodBias);
 				tex->lodBias = c.textureLod.lodBias;
 			}
@@ -1011,6 +1101,22 @@ void GLQueueRunner::PerformRenderPass(const GLRStep &step) {
 				glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_LOD, c.textureLod.maxLod);
 				tex->maxLod = c.textureLod.maxLod;
 			}
+			break;
+		}
+		case GLRRenderCommand::TEXTURE_SUBIMAGE:
+		{
+			GLRTexture *tex = c.texture_subimage.texture;
+			// TODO: Need bind?
+			if (!c.texture_subimage.data)
+				Crash();
+			// For things to show in RenderDoc, need to split into glTexImage2D(..., nullptr) and glTexSubImage.
+			glTexSubImage2D(tex->target, c.texture_subimage.level, c.texture_subimage.x, c.texture_subimage.y, c.texture_subimage.width, c.texture_subimage.height, c.texture_subimage.format, c.texture_subimage.type, c.texture_subimage.data);
+			if (c.texture_subimage.allocType == GLRAllocType::ALIGNED) {
+				FreeAlignedMemory(c.texture_subimage.data);
+			} else if (c.texture_subimage.allocType == GLRAllocType::NEW) {
+				delete[] c.texture_subimage.data;
+			}
+			CHECK_GL_ERROR_IF_DEBUG();
 			break;
 		}
 		case GLRRenderCommand::RASTER:
@@ -1066,7 +1172,9 @@ void GLQueueRunner::PerformRenderPass(const GLRStep &step) {
 	glDisable(GL_BLEND);
 	glDisable(GL_CULL_FACE);
 #ifndef USING_GLES2
-	glDisable(GL_COLOR_LOGIC_OP);
+	if (!gl_extensions.IsGLES) {
+		glDisable(GL_COLOR_LOGIC_OP);
+	}
 #endif
 	glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 	CHECK_GL_ERROR_IF_DEBUG();
@@ -1200,7 +1308,7 @@ void GLQueueRunner::PerformReadback(const GLRStep &pass) {
 	if (!gl_extensions.IsGLES || gl_extensions.GLES3) {
 		glPixelStorei(GL_PACK_ROW_LENGTH, 0);
 	}
-	if (convert) {
+	if (convert && tempBuffer_ && readbackBuffer_) {
 		ConvertFromRGBA8888(readbackBuffer_, tempBuffer_, pixelStride, pixelStride, rect.w, rect.h, pass.readback.dstFormat);
 	}
 
@@ -1208,27 +1316,52 @@ void GLQueueRunner::PerformReadback(const GLRStep &pass) {
 }
 
 void GLQueueRunner::PerformReadbackImage(const GLRStep &pass) {
-	GLRTexture *tex = pass.readback_image.texture;
-
-	glBindTexture(GL_TEXTURE_2D, tex->texture);
-
-	CHECK_GL_ERROR_IF_DEBUG();
-
 #ifndef USING_GLES2
-	int pixelStride = pass.readback_image.srcRect.w;
-	glPixelStorei(GL_PACK_ALIGNMENT, 4);
-
+	GLRTexture *tex = pass.readback_image.texture;
 	GLRect2D rect = pass.readback_image.srcRect;
 
-	int size = 4 * rect.w * rect.h;
-	if (size > readbackBufferSize_) {
-		delete[] readbackBuffer_;
-		readbackBuffer_ = new uint8_t[size];
-		readbackBufferSize_ = size;
-	}
+	if (gl_extensions.VersionGEThan(4, 5)) {
+		int size = 4 * rect.w * rect.h;
+		if (size > readbackBufferSize_) {
+			delete[] readbackBuffer_;
+			readbackBuffer_ = new uint8_t[size];
+			readbackBufferSize_ = size;
+		}
 
-	glPixelStorei(GL_PACK_ALIGNMENT, 4);
-	glGetTexImage(GL_TEXTURE_2D, pass.readback_image.mipLevel, GL_RGBA, GL_UNSIGNED_BYTE, readbackBuffer_);
+		glPixelStorei(GL_PACK_ALIGNMENT, 4);
+		glGetTextureSubImage(tex->texture, pass.readback_image.mipLevel, rect.x, rect.y, 0, rect.w, rect.h, 1, GL_RGBA, GL_UNSIGNED_BYTE, readbackBufferSize_, readbackBuffer_);
+	} else {
+		glBindTexture(GL_TEXTURE_2D, tex->texture);
+
+		CHECK_GL_ERROR_IF_DEBUG();
+
+		GLint w, h;
+		// This is only used for debugging (currently), and GL doesn't support a subrectangle.
+		glGetTexLevelParameteriv(GL_TEXTURE_2D, pass.readback_image.mipLevel, GL_TEXTURE_WIDTH, &w);
+		glGetTexLevelParameteriv(GL_TEXTURE_2D, pass.readback_image.mipLevel, GL_TEXTURE_HEIGHT, &h);
+
+		int size = 4 * std::max((int)w, rect.x + rect.w) * std::max((int)h, rect.h);
+		if (size > readbackBufferSize_) {
+			delete[] readbackBuffer_;
+			readbackBuffer_ = new uint8_t[size];
+			readbackBufferSize_ = size;
+		}
+
+		glPixelStorei(GL_PACK_ALIGNMENT, 4);
+		glPixelStorei(GL_PACK_ROW_LENGTH, rect.x + rect.w);
+		glGetTexImage(GL_TEXTURE_2D, pass.readback_image.mipLevel, GL_RGBA, GL_UNSIGNED_BYTE, readbackBuffer_);
+		glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+
+		if (rect.x != 0 || rect.y != 0) {
+			int dstStride = 4 * rect.w;
+			int srcStride = 4 * (rect.x + rect.w);
+			int xoff = 4 * rect.x;
+			int yoff = rect.y * srcStride;
+			for (int y = 0; y < rect.h; ++y) {
+				memmove(readbackBuffer_ + h * dstStride, readbackBuffer_ + yoff + h * srcStride + xoff, dstStride);
+			}
+		}
+	}
 #endif
 
 	CHECK_GL_ERROR_IF_DEBUG();
@@ -1260,6 +1393,10 @@ void GLQueueRunner::CopyReadbackBuffer(int width, int height, Draw::DataFormat s
 	// don't usually provide very optimized conversion implementations, though some do.
 	// Just need to be careful about dithering, which may break Danganronpa.
 	int bpp = (int)Draw::DataFormatSizeInBytes(destFormat);
+	if (!readbackBuffer_ || bpp <= 0 || !pixels) {
+		// Something went wrong during the read and no readback buffer was allocated, probably.
+		return;
+	}
 	for (int y = 0; y < height; y++) {
 		memcpy(pixels + y * pixelStride * bpp, readbackBuffer_ + y * width * bpp, width * bpp);
 	}
@@ -1408,36 +1545,30 @@ GLRFramebuffer::~GLRFramebuffer() {
 		return;
 
 	CHECK_GL_ERROR_IF_DEBUG();
-	if (gl_extensions.ARB_framebuffer_object || gl_extensions.IsGLES) {
-		if (handle) {
+	if (handle) {
+		if (gl_extensions.ARB_framebuffer_object || gl_extensions.IsGLES) {
 			glBindFramebuffer(GL_FRAMEBUFFER, handle);
 			glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
 			glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, 0);
 			glBindFramebuffer(GL_FRAMEBUFFER, g_defaultFBO);
 			glDeleteFramebuffers(1, &handle);
-		}
-		if (z_stencil_buffer)
-			glDeleteRenderbuffers(1, &z_stencil_buffer);
-		if (z_buffer)
-			glDeleteRenderbuffers(1, &z_buffer);
-		if (stencil_buffer)
-			glDeleteRenderbuffers(1, &stencil_buffer);
-	} else if (gl_extensions.EXT_framebuffer_object) {
 #ifndef USING_GLES2
-		if (handle) {
+		} else if (gl_extensions.EXT_framebuffer_object) {
 			glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, handle);
 			glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
 			glFramebufferRenderbufferEXT(GL_FRAMEBUFFER_EXT, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER_EXT, 0);
 			glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, g_defaultFBO);
 			glDeleteFramebuffersEXT(1, &handle);
-		}
-		if (z_stencil_buffer)
-			glDeleteRenderbuffers(1, &z_stencil_buffer);
-		if (z_buffer)
-			glDeleteRenderbuffers(1, &z_buffer);
-		if (stencil_buffer)
-			glDeleteRenderbuffers(1, &stencil_buffer);
 #endif
+		}
 	}
+
+	// These can only be set when supported.
+	if (z_stencil_buffer)
+		glDeleteRenderbuffers(1, &z_stencil_buffer);
+	if (z_buffer)
+		glDeleteRenderbuffers(1, &z_buffer);
+	if (stencil_buffer)
+		glDeleteRenderbuffers(1, &stencil_buffer);
 	CHECK_GL_ERROR_IF_DEBUG();
 }

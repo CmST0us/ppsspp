@@ -1,13 +1,20 @@
 #include <algorithm>
 
+#include "base/colorutil.h"
+#include "base/timeutil.h"
 #include "thin3d/thin3d.h"
 #include "image/zim_load.h"
 #include "image/png_load.h"
 #include "math/math_util.h"
+#include "math/curves.h"
 #include "file/vfs.h"
 #include "ext/jpge/jpgd.h"
-#include "UI/TextureUtil.h"
+#include "ui/view.h"
+#include "ui/ui_context.h"
+#include "gfx_es2/draw_buffer.h"
 #include "Common/Log.h"
+#include "UI/TextureUtil.h"
+#include "UI/GameInfoCache.h"
 
 static Draw::DataFormat ZimToT3DFormat(int zim) {
 	switch (zim) {
@@ -110,6 +117,7 @@ bool ManagedTexture::LoadFromFileData(const uint8_t *data, size_t dataSize, Imag
 		num_levels = 1;
 	}
 
+	// Free the old texture, if any.
 	if (texture_) {
 		delete texture_;
 		texture_ = nullptr;
@@ -134,7 +142,7 @@ bool ManagedTexture::LoadFromFileData(const uint8_t *data, size_t dataSize, Imag
 		if (image[i])
 			free(image[i]);
 	}
-	return texture_ != nullptr;
+	return texture_;
 }
 
 bool ManagedTexture::LoadFromFile(const std::string &filename, ImageFileType type, bool generateMips) {
@@ -200,6 +208,44 @@ std::unique_ptr<ManagedTexture> CreateTextureFromFileData(Draw::DrawContext *dra
 	if (!draw)
 		return std::unique_ptr<ManagedTexture>();
 	ManagedTexture *mtex = new ManagedTexture(draw);
-	mtex->LoadFromFileData(data, size, type, generateMips);
-	return std::unique_ptr<ManagedTexture>(mtex);
+	if (mtex->LoadFromFileData(data, size, type, generateMips)) {
+		return std::unique_ptr<ManagedTexture>(mtex);
+	} else {
+		// Best to return a null pointer if we fail!
+		delete mtex;
+		return std::unique_ptr<ManagedTexture>();
+	}
+}
+
+void GameIconView::GetContentDimensions(const UIContext &dc, float &w, float &h) const {
+	w = textureWidth_;
+	h = textureHeight_;
+}
+
+void GameIconView::Draw(UIContext &dc) {
+	using namespace UI;
+	std::shared_ptr<GameInfo> info = g_gameInfoCache->GetInfo(NULL, gamePath_, GAMEINFO_WANTBG | GAMEINFO_WANTSIZE);
+
+	if (!info->icon.texture) {
+		return;
+	}
+
+	textureWidth_ = info->icon.texture->Width();
+	textureHeight_ = info->icon.texture->Height();
+
+	// Fade icon with the backgrounds.
+	double loadTime = info->icon.timeLoaded;
+	if (info->pic1.texture) {
+		loadTime = std::max(loadTime, info->pic1.timeLoaded);
+	}
+	if (info->pic0.texture) {
+		loadTime = std::max(loadTime, info->pic0.timeLoaded);
+	}
+	uint32_t color = whiteAlpha(ease((time_now_d() - loadTime) * 3));
+
+	dc.Flush();
+	dc.GetDrawContext()->BindTexture(0, info->icon.texture->GetTexture());
+	dc.Draw()->Rect(bounds_.x, bounds_.y, bounds_.w, bounds_.h, color);
+	dc.Flush();
+	dc.RebindTexture();
 }

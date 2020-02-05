@@ -211,26 +211,24 @@ bool FileInfo::operator <(const FileInfo &other) const {
 size_t getFilesInDir(const char *directory, std::vector<FileInfo> *files, const char *filter, int flags) {
 	size_t foundEntries = 0;
 	std::set<std::string> filters;
-	std::string tmp;
 	if (filter) {
+		std::string tmp;
 		while (*filter) {
 			if (*filter == ':') {
-				filters.insert(tmp);
-				tmp = "";
+				filters.insert(std::move(tmp));
 			} else {
 				tmp.push_back(*filter);
 			}
 			filter++;
 		}
+		if (!tmp.empty())
+			filters.insert(std::move(tmp));
 	}
-	if (tmp.size())
-		filters.insert(tmp);
 #ifdef _WIN32
 	// Find the first file in the directory.
 	WIN32_FIND_DATA ffd;
 	HANDLE hFind = FindFirstFileEx((ConvertUTF8ToWString(directory) + L"\\*").c_str(), FindExInfoStandard, &ffd, FindExSearchNameMatch, NULL, 0);
 	if (hFind == INVALID_HANDLE_VALUE) {
-		FindClose(hFind);
 		return 0;
 	}
 	// windows loop
@@ -238,8 +236,6 @@ size_t getFilesInDir(const char *directory, std::vector<FileInfo> *files, const 
 	{
 		const std::string virtualName = ConvertWStringToUTF8(ffd.cFileName);
 #else
-	struct dirent_large { struct dirent entry; char padding[FILENAME_MAX+1]; };
-	struct dirent_large diren;
 	struct dirent *result = NULL;
 
 	//std::string directoryWithSlash = directory;
@@ -250,19 +246,25 @@ size_t getFilesInDir(const char *directory, std::vector<FileInfo> *files, const 
 	if (!dirp)
 		return 0;
 	// non windows loop
-	while (!readdir_r(dirp, (dirent*) &diren, &result) && result)
+	while ((result = readdir(dirp)))
 	{
 		const std::string virtualName(result->d_name);
 #endif
 		// check for "." and ".."
-		if (((virtualName[0] == '.') && (virtualName[1] == '\0')) ||
-			((virtualName[0] == '.') && (virtualName[1] == '.') && 
-			(virtualName[2] == '\0')))
+		if (virtualName == "." || virtualName == "..")
 			continue;
 
 		// Remove dotfiles (optional with flag.)
-		if (!(flags & GETFILES_GETHIDDEN) && virtualName[0] == '.')
-			continue;
+		if (!(flags & GETFILES_GETHIDDEN))
+		{
+#ifdef _WIN32
+			if ((ffd.dwFileAttributes & FILE_ATTRIBUTE_HIDDEN) != 0)
+				continue;
+#else
+			if (virtualName[0] == '.')
+				continue;
+#endif
+		}
 
 		FileInfo info;
 		info.name = virtualName;
@@ -286,7 +288,7 @@ size_t getFilesInDir(const char *directory, std::vector<FileInfo> *files, const 
 		}
 
 		if (files)
-			files->push_back(info);
+			files->push_back(std::move(info));
 		foundEntries++;
 #ifdef _WIN32
 	} while (FindNextFile(hFind, &ffd) != 0);
@@ -298,6 +300,22 @@ size_t getFilesInDir(const char *directory, std::vector<FileInfo> *files, const 
 	if (files)
 		std::sort(files->begin(), files->end());
 	return foundEntries;
+}
+
+int64_t getDirectoryRecursiveSize(const std::string &path, const char *filter, int flags) {
+	std::vector<FileInfo> fileInfo;
+	getFilesInDir(path.c_str(), &fileInfo, filter, flags);
+	int64_t sizeSum = 0;
+	// Note: getFileInDir does not fill in fileSize properly.
+	for (size_t i = 0; i < fileInfo.size(); i++) {
+		FileInfo finfo;
+		getFileInfo(fileInfo[i].fullName.c_str(), &finfo);
+		if (!finfo.isDirectory)
+			sizeSum += finfo.size;
+		else
+			sizeSum += getDirectoryRecursiveSize(finfo.fullName, filter, flags);
+	}
+	return sizeSum;
 }
 
 #ifdef _WIN32

@@ -88,9 +88,11 @@ bool GameInfo::Delete() {
 	case IdentifiedFileType::ARCHIVE_RAR:
 	case IdentifiedFileType::ARCHIVE_ZIP:
 	case IdentifiedFileType::ARCHIVE_7Z:
+	case IdentifiedFileType::PPSSPP_GE_DUMP:
 		{
 			const std::string &fileToRemove = filePath_;
 			File::Delete(fileToRemove);
+			g_Config.RemoveRecent(filePath_);
 			return true;
 		}
 
@@ -110,27 +112,11 @@ bool GameInfo::Delete() {
 	}
 }
 
-static int64_t GetDirectoryRecursiveSize(const std::string &path) {
-	std::vector<FileInfo> fileInfo;
-	getFilesInDir(path.c_str(), &fileInfo);
-	int64_t sizeSum = 0;
-	// Note: getFileInDir does not fill in fileSize properly.
-	for (size_t i = 0; i < fileInfo.size(); i++) {
-		FileInfo finfo;
-		getFileInfo(fileInfo[i].fullName.c_str(), &finfo);
-		if (!finfo.isDirectory)
-			sizeSum += finfo.size;
-		else
-			sizeSum += GetDirectoryRecursiveSize(finfo.fullName);
-	}
-	return sizeSum;
-}
-
 u64 GameInfo::GetGameSizeInBytes() {
 	switch (fileType) {
 	case IdentifiedFileType::PSP_PBP_DIRECTORY:
 	case IdentifiedFileType::PSP_SAVEDATA_DIRECTORY:
-		return GetDirectoryRecursiveSize(ResolvePBPDirectory(filePath_));
+		return getDirectoryRecursiveSize(ResolvePBPDirectory(filePath_), nullptr, GETFILES_GETHIDDEN);
 
 	default:
 		return GetFileLoader()->FileSize();
@@ -229,6 +215,11 @@ bool GameInfo::LoadFromPath(const std::string &gamePath) {
 }
 
 std::shared_ptr<FileLoader> GameInfo::GetFileLoader() {
+	if (filePath_.empty()) {
+		// Happens when workqueue tries to figure out priorities in PrioritizedWorkQueue::Pop(),
+		// because priority() calls GetFileLoader()... gnarly.
+		return fileLoader;
+	}
 	if (!fileLoader) {
 		fileLoader.reset(ConstructFileLoader(filePath_));
 	}
@@ -742,7 +733,8 @@ void GameInfoCache::WaitUntilDone(std::shared_ptr<GameInfo> &info) {
 }
 
 
-// Runs on the main thread.
+// Runs on the main thread. Only call from render() and similar, not update()!
+// Can also be called from the audio thread for menu background music.
 std::shared_ptr<GameInfo> GameInfoCache::GetInfo(Draw::DrawContext *draw, const std::string &gamePath, int wantFlags) {
 	std::shared_ptr<GameInfo> info;
 
@@ -800,7 +792,7 @@ void GameInfoCache::SetupTexture(std::shared_ptr<GameInfo> &info, Draw::DrawCont
 			if (tex.texture) {
 				tex.timeLoaded = time_now_d();
 			} else {
-				ERROR_LOG(G3D, "Failed creating texture");
+				ERROR_LOG(G3D, "Failed creating texture (%s)", info->GetTitle().c_str());
 			}
 		}
 		if ((info->wantFlags & GAMEINFO_WANTBGDATA) == 0) {

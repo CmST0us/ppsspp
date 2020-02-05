@@ -27,30 +27,53 @@ HTTPFileLoader::HTTPFileLoader(const std::string &filename)
 
 void HTTPFileLoader::Prepare() {
 	std::call_once(preparedFlag_, [this](){
-		if (!client_.Resolve(url_.Host().c_str(), url_.Port())) {
-			// TODO: Should probably set some flag?
-			return;
-		}
-
-		Connect();
-		if (!connected_) {
-			return;
-		}
-
-		int err = client_.SendRequest("HEAD", url_.Resource().c_str());
-		if (err < 0) {
-			Disconnect();
-			return;
-		}
-
-		Buffer readbuf;
 		std::vector<std::string> responseHeaders;
-		int code = client_.ReadResponseHeaders(&readbuf, responseHeaders);
-		if (code != 200) {
-			// Leave size at 0, invalid.
-			ERROR_LOG(LOADER, "HTTP request failed, got %03d for %s", code, filename_.c_str());
-			Disconnect();
-			return;
+		Url resourceURL = url_;
+		int redirectsLeft = 20;
+		while (redirectsLeft > 0) {
+			responseHeaders.clear();
+			int code = SendHEAD(resourceURL, responseHeaders);
+			if (code == -400) {
+				// Already reported the error.
+				return;
+			}
+
+			if (code == 301 || code == 302 || code == 303 || code == 307 || code == 308) {
+				Disconnect();
+
+				std::string redirectURL;
+				if (http::GetHeaderValue(responseHeaders, "Location", &redirectURL)) {
+					Url url(resourceURL);
+					url = url.Relative(redirectURL);
+
+					if (url.ToString() == url_.ToString() || url.ToString() == resourceURL.ToString()) {
+						ERROR_LOG(LOADER, "HTTP request failed, hit a redirect loop");
+						latestError_ = "Could not connect (redirect loop)";
+						return;
+					}
+
+					resourceURL = url;
+					redirectsLeft--;
+					continue;
+				}
+
+				// No Location header?
+				ERROR_LOG(LOADER, "HTTP request failed, invalid redirect");
+				latestError_ = "Could not connect (invalid response)";
+				return;
+			}
+
+			if (code != 200) {
+				// Leave size at 0, invalid.
+				ERROR_LOG(LOADER, "HTTP request failed, got %03d for %s", code, filename_.c_str());
+				latestError_ = "Could not connect (invalid response)";
+				Disconnect();
+				return;
+			}
+
+			// We got a good, non-redirect response.
+			redirectsLeft = 0;
+			url_ = resourceURL;
 		}
 
 		// TODO: Expire cache via ETag, etc.
@@ -87,6 +110,39 @@ void HTTPFileLoader::Prepare() {
 
 		// If we didn't end up with a filesize_ (e.g. chunked response), give up.  File invalid.
 	});
+}
+
+int HTTPFileLoader::SendHEAD(const Url &url, std::vector<std::string> &responseHeaders) {
+	if (!url.Valid()) {
+		ERROR_LOG(LOADER, "HTTP request failed, invalid URL");
+		latestError_ = "Invalid URL";
+		return -400;
+	}
+
+	if (!client_.Resolve(url.Host().c_str(), url.Port())) {
+		ERROR_LOG(LOADER, "HTTP request failed, unable to resolve: |%s| port %d", url.Host().c_str(), url.Port());
+		latestError_ = "Could not connect (name not resolved)";
+		return -400;
+	}
+
+	client_.SetDataTimeout(20.0);
+	Connect();
+	if (!connected_) {
+		ERROR_LOG(LOADER, "HTTP request failed, failed to connect: %s port %d", url.Host().c_str(), url.Port());
+		latestError_ = "Could not connect (refused to connect)";
+		return -400;
+	}
+
+	int err = client_.SendRequest("HEAD", url.Resource().c_str());
+	if (err < 0) {
+		ERROR_LOG(LOADER, "HTTP request failed, failed to send request: %s port %d", url.Host().c_str(), url.Port());
+		latestError_ = "Could not connect (could not request data)";
+		Disconnect();
+		return -400;
+	}
+
+	Buffer readbuf;
+	return client_.ReadResponseHeaders(&readbuf, responseHeaders);
 }
 
 HTTPFileLoader::~HTTPFileLoader() {
@@ -138,6 +194,7 @@ size_t HTTPFileLoader::ReadAt(s64 absolutePos, size_t bytes, void *data, Flags f
 
 	int err = client_.SendRequest("GET", url_.Resource().c_str(), requestHeaders, nullptr);
 	if (err < 0) {
+		latestError_ = "Invalid response reading data";
 		Disconnect();
 		return 0;
 	}
@@ -147,6 +204,7 @@ size_t HTTPFileLoader::ReadAt(s64 absolutePos, size_t bytes, void *data, Flags f
 	int code = client_.ReadResponseHeaders(&readbuf, responseHeaders);
 	if (code != 206) {
 		ERROR_LOG(LOADER, "HTTP server did not respond with range, received code=%03d", code);
+		latestError_ = "Invalid response reading data";
 		Disconnect();
 		return 0;
 	}
@@ -185,6 +243,7 @@ size_t HTTPFileLoader::ReadAt(s64 absolutePos, size_t bytes, void *data, Flags f
 
 	if (!supportedResponse) {
 		ERROR_LOG(LOADER, "HTTP server did not respond with the range we wanted.");
+		latestError_ = "Invalid response reading data";
 		return 0;
 	}
 

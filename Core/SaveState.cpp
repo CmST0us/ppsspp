@@ -240,6 +240,7 @@ namespace SaveState
 	static bool needsProcess = false;
 	static std::vector<Operation> pending;
 	static std::mutex mutex;
+	static int screenshotFailures = 0;
 	static bool hasLoadedState = false;
 	static const int STALE_STATE_USES = 2;
 	// 4 hours of total gameplay since the virtual PSP started the game.
@@ -249,6 +250,7 @@ namespace SaveState
 
 	// TODO: Should this be configurable?
 	static const int REWIND_NUM_STATES = 20;
+	static const int SCREENSHOT_FAILURE_RETRIES = 15;
 	static StateRingbuffer rewindStates(REWIND_NUM_STATES);
 	// TODO: Any reason for this to be configurable?
 	const static float rewindMaxWallFrequency = 1.0f;
@@ -628,9 +630,9 @@ namespace SaveState
 		// Okay, first, let's give the rewind state a shot - maybe we can at least not reset entirely.
 		// Even if this was a rewind, maybe we can still load a previous one.
 		CChunkFileReader::Error result;
-		do
+		do {
 			result = rewindStates.Restore();
-		while (result == CChunkFileReader::ERROR_BROKEN_STATE);
+		} while (result == CChunkFileReader::ERROR_BROKEN_STATE);
 
 		if (result == CChunkFileReader::ERROR_NONE) {
 			return true;
@@ -852,6 +854,12 @@ namespace SaveState
 				callbackResult = tempResult ? Status::SUCCESS : Status::FAILURE;
 				if (!tempResult) {
 					ERROR_LOG(SAVESTATE, "Failed to take a screenshot for the savestate! %s", op.filename.c_str());
+					if (screenshotFailures++ < SCREENSHOT_FAILURE_RETRIES) {
+						// Requeue for next frame.
+						SaveScreenshot(op.filename, op.callback, op.cbUserData);
+					}
+				} else {
+					screenshotFailures = 0;
 				}
 				break;
 			}

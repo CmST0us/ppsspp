@@ -286,7 +286,7 @@ void TouchControlLayoutScreen::resized() {
 }
 
 void TouchControlLayoutScreen::onFinish(DialogResult reason) {
-	g_Config.Save();
+	g_Config.Save("TouchControlLayoutScreen::onFinish");
 }
 
 UI::EventReturn TouchControlLayoutScreen::OnVisibility(UI::EventParams &e) {
@@ -420,6 +420,9 @@ void TouchControlLayoutScreen::CreateViews() {
 
 	if (g_Config.touchAnalogStick.show) {
 		controls_.push_back(new DragDropButton(g_Config.touchAnalogStick, stickBg, stickImage));
+	}
+	if (g_Config.touchRightAnalogStick.show) {
+		controls_.push_back(new DragDropButton(g_Config.touchRightAnalogStick, stickBg, stickImage));
 	}
 	if (g_Config.touchCombo0.show) {
 		controls_.push_back(new DragDropButton(g_Config.touchCombo0, roundImage, comboKeyImages[0]));

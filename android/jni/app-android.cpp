@@ -101,8 +101,9 @@ static int deviceType;
 
 // Should only be used for display detection during startup (for config defaults etc)
 // This is the ACTUAL display size, not the hardware scaled display size.
-static int display_xres;
-static int display_yres;
+// Exposed so it can be displayed on the touchscreen test.
+int display_xres;
+int display_yres;
 static int display_dpi_x;
 static int display_dpi_y;
 static int backbuffer_format;	// Android PixelFormat enum
@@ -193,6 +194,7 @@ static void EmuThreadFunc() {
 	while (emuThreadState != (int)EmuThreadState::QUIT_REQUESTED) {
 		UpdateRunLoopAndroid(env);
 	}
+	ILOG("QUIT_REQUESTED found, left loop. Setting state to STOPPED.");
 	emuThreadState = (int)EmuThreadState::STOPPED;
 
 	NativeShutdownGraphics();
@@ -213,8 +215,8 @@ static void EmuThreadStart() {
 // Call EmuThreadStop first, then keep running the GPU (or eat commands)
 // as long as emuThreadState isn't STOPPED and/or there are still things queued up.
 // Only after that, call EmuThreadJoin.
-static void EmuThreadStop() {
-	ILOG("EmuThreadStop - stopping...");
+static void EmuThreadStop(const char *caller) {
+	ILOG("EmuThreadStop - stopping (%s)...", caller);
 	emuThreadState = (int)EmuThreadState::QUIT_REQUESTED;
 }
 
@@ -244,6 +246,10 @@ void Vibrate(int length_ms) {
 	char temp[32];
 	sprintf(temp, "%i", length_ms);
 	PushCommand("vibrate", temp);
+}
+
+void OpenDirectory(const char *path) {
+	// Unsupported
 }
 
 void LaunchBrowser(const char *url) {
@@ -399,6 +405,8 @@ extern "C" void Java_org_ppsspp_ppsspp_NativeApp_init
 	systemName = GetJavaString(env, jmodel);
 	langRegion = GetJavaString(env, jlangRegion);
 
+	ILOG("NativeApp.init(): device name: '%s'", systemName.c_str());
+
 	std::string externalDir = GetJavaString(env, jexternalDir);
 	std::string user_data_path = GetJavaString(env, jdataDir);
 	if (user_data_path.size() > 0)
@@ -499,7 +507,7 @@ extern "C" void Java_org_ppsspp_ppsspp_NativeApp_audioInit(JNIEnv *, jclass) {
 
 	ILOG("NativeApp.audioInit() -- Using OpenSL audio! frames/buffer: %i	 optimal sr: %i	 actual sr: %i", optimalFramesPerBuffer, optimalSampleRate, sampleRate);
 	if (!g_audioState) {
-		g_audioState = AndroidAudio_Init(&NativeMix, library_path, framesPerBuffer, sampleRate);
+		g_audioState = AndroidAudio_Init(&NativeMix, framesPerBuffer, sampleRate);
 	} else {
 		ELOG("Audio state already initialized");
 	}
@@ -527,15 +535,16 @@ extern "C" void Java_org_ppsspp_ppsspp_NativeApp_pause(JNIEnv *, jclass) {
 extern "C" void Java_org_ppsspp_ppsspp_NativeApp_shutdown(JNIEnv *, jclass) {
 	if (renderer_inited && useCPUThread && graphicsContext) {
 		// Only used in Java EGL path.
-		EmuThreadStop();
+		EmuThreadStop("shutdown");
+		ILOG("BeginAndroidShutdown");
 		graphicsContext->BeginAndroidShutdown();
 		// Skipping GL calls, the old context is gone.
 		while (graphicsContext->ThreadFrame()) {
 			ILOG("graphicsContext->ThreadFrame executed to clear buffers");
-			continue;
 		}
 		ILOG("Joining emuthread");
 		EmuThreadJoin();
+		ILOG("Joined emuthread");
 
 		graphicsContext->ThreadEnd();
 		graphicsContext->ShutdownFromRenderThread();
@@ -566,15 +575,17 @@ extern "C" void Java_org_ppsspp_ppsspp_NativeRenderer_displayInit(JNIEnv * env, 
 	// We should be running on the render thread here.
 	std::string errorMessage;
 	if (renderer_inited) {
-		// Would be really nice if we could get something on the GL thread immediately when shutting down...
+		// Would be really nice if we could get something on the GL thread immediately when shutting down.
 		ILOG("NativeApp.displayInit() restoring");
 		if (useCPUThread) {
-			EmuThreadStop();
+			EmuThreadStop("displayInit");
 			graphicsContext->BeginAndroidShutdown();
+			ILOG("BeginAndroidShutdown. Looping until emu thread done...");
 			// Skipping GL calls here because the old context is lost.
 			while (graphicsContext->ThreadFrame()) {
 				continue;
 			}
+			ILOG("Joining emu thread");
 			EmuThreadJoin();
 		} else {
 			NativeShutdownGraphics();
@@ -601,6 +612,31 @@ extern "C" void Java_org_ppsspp_ppsspp_NativeRenderer_displayInit(JNIEnv * env, 
 	NativeMessageReceived("recreateviews", "");
 }
 
+static void recalculateDpi() {
+	g_dpi = display_dpi_x;
+	g_dpi_scale_x = 240.0f / display_dpi_x;
+	g_dpi_scale_y = 240.0f / display_dpi_y;
+	g_dpi_scale_real_x = g_dpi_scale_x;
+	g_dpi_scale_real_y = g_dpi_scale_y;
+
+	dp_xres = display_xres * g_dpi_scale_x;
+	dp_yres = display_yres * g_dpi_scale_y;
+
+	// Touch scaling is from display pixels to dp pixels.
+	// Wait, doesn't even make sense... this is equal to g_dpi_scale_x. TODO: Figure out what's going on!
+	dp_xscale = (float)dp_xres / (float)display_xres;
+	dp_yscale = (float)dp_yres / (float)display_yres;
+
+	pixel_in_dps_x = (float)pixel_xres / dp_xres;
+	pixel_in_dps_y = (float)pixel_yres / dp_yres;
+
+	ILOG("RecalcDPI: display_xres=%d display_yres=%d", display_xres, display_yres);
+	ILOG("RecalcDPI: g_dpi=%f g_dpi_scale_x=%f g_dpi_scale_y=%f", g_dpi, g_dpi_scale_x, g_dpi_scale_y);
+	ILOG("RecalcDPI: dp_xscale=%f dp_yscale=%f", dp_xscale, dp_yscale);
+	ILOG("RecalcDPI: dp_xres=%d dp_yres=%d", dp_xres, dp_yres);
+	ILOG("RecalcDPI: pixel_xres=%d pixel_yres=%d", pixel_xres, pixel_yres);
+}
+
 extern "C" void JNICALL Java_org_ppsspp_ppsspp_NativeApp_backbufferResize(JNIEnv *, jclass, jint bufw, jint bufh, jint format) {
 	ILOG("NativeApp.backbufferResize(%d x %d)", bufw, bufh);
 
@@ -612,32 +648,13 @@ extern "C" void JNICALL Java_org_ppsspp_ppsspp_NativeApp_backbufferResize(JNIEnv
 	pixel_yres = bufh;
 	backbuffer_format = format;
 
-	g_dpi = display_dpi_x;
-	g_dpi_scale_x = 240.0f / g_dpi;
-	g_dpi_scale_y = 240.0f / g_dpi;
-	g_dpi_scale_real_x = g_dpi_scale_x;
-	g_dpi_scale_real_y = g_dpi_scale_y;
-
-	dp_xres = display_xres * g_dpi_scale_x;
-	dp_yres = display_yres * g_dpi_scale_y;
-
-	// Touch scaling is from display pixels to dp pixels.
-	dp_xscale = (float)dp_xres / (float)display_xres;
-	dp_yscale = (float)dp_yres / (float)display_yres;
-
-	pixel_in_dps_x = (float)pixel_xres / dp_xres;
-	pixel_in_dps_y = (float)pixel_yres / dp_yres;
-
-	ILOG("g_dpi=%f g_dpi_scale_x=%f g_dpi_scale_y=%f", g_dpi, g_dpi_scale_x, g_dpi_scale_y);
-	ILOG("dp_xscale=%f dp_yscale=%f", dp_xscale, dp_yscale);
-	ILOG("dp_xres=%d dp_yres=%d", dp_xres, dp_yres);
-	ILOG("pixel_xres=%d pixel_yres=%d", pixel_xres, pixel_yres);
+	recalculateDpi();
 
 	if (new_size) {
 		ILOG("Size change detected (previously %d,%d) - calling NativeResized()", old_w, old_h);
 		NativeResized();
 	} else {
-		ILOG("Size didn't change.");
+		ILOG("NativeApp::backbufferResize: Size didn't change.");
 	}
 }
 
@@ -878,11 +895,6 @@ void getDesiredBackbufferSize(int &sz_x, int &sz_y) {
 		sz_x = 0;
 		sz_y = 0;
 	}
-	// Round the size up to the nearest multiple of 4. While this may cause a tiny aspect ratio distortion,
-	// there's some hope that #11151 is a driver bug that might be worked around this way. If this fixes it,
-	// it'll be worth trying to round to a multiple of 2 instead.
-	sz_x = (sz_x + 3) & ~3;
-	sz_y = (sz_y + 3) & ~3;
 }
 
 extern "C" void JNICALL Java_org_ppsspp_ppsspp_NativeApp_setDisplayParameters(JNIEnv *, jclass, jint xres, jint yres, jint dpi, jfloat refreshRate) {
@@ -892,6 +904,9 @@ extern "C" void JNICALL Java_org_ppsspp_ppsspp_NativeApp_setDisplayParameters(JN
 	display_dpi_x = dpi;
 	display_dpi_y = dpi;
 	display_hz = refreshRate;
+
+	recalculateDpi();
+	NativeResized();
 }
 
 extern "C" void JNICALL Java_org_ppsspp_ppsspp_NativeApp_computeDesiredBackbufferDimensions() {
@@ -969,8 +984,13 @@ retry:
 			ILOG("Trying again, this time with OpenGL.");
 			g_Config.iGPUBackend = (int)GPUBackend::OPENGL;
 			SetGPUBackend((GPUBackend)g_Config.iGPUBackend);
-			tries++;
-			goto retry;
+			// If we were still supporting EGL for GL:
+			// tries++;
+			// goto retry;
+			delete graphicsContext;
+			graphicsContext = nullptr;
+			renderLoopRunning = false;
+			return false;
 		}
 
 		delete graphicsContext;
@@ -1018,7 +1038,7 @@ retry:
 	ILOG("Leaving EGL/Vulkan render loop.");
 
 	if (useCPUThread) {
-		EmuThreadStop();
+		EmuThreadStop("exitrenderloop");
 		while (graphicsContext->ThreadFrame()) {
 			continue;
 		}
